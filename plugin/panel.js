@@ -246,12 +246,14 @@
     e.target.blur()
   })
 
-  /* job-jump from transcript lines */
+  /* job-jump from transcript lines: resolve the id against the session
+   * currently shown (ids collide across sessions — ssh-1 everywhere) */
   content.addEventListener('click', function (e) {
     var line = e.target && e.target.closest ? e.target.closest('[data-job]') : null
     if (line === null || line === undefined) return
     switchSub('jobs')
-    selectJob(line.dataset.job, null)
+    var row = sessionRows.find(function (r) { return rowKey(r) === activeFile })
+    selectJob(line.dataset.job, row !== undefined ? row.agentId : null)
   })
 
   /* ---------- jobs ---------- */
@@ -272,9 +274,11 @@
       body: JSON.stringify({ id: selectedJob }),
     }).then(refreshJobs).catch(function () {})
   })
+  function jobKey(id, agentId) { return String(agentId) + '/' + String(id) }
+
   $c('#dsr-jd-locate').addEventListener('click', function () {
     if (selectedJob === null) return
-    var j = jobs.get(selectedJob)
+    var j = jobs.get(jobKey(selectedJob, selectedJobAgent))
     if (j === undefined) return
     var row = rowByAgent(j.agentId)
     if (row === null) return
@@ -323,7 +327,7 @@
     rows.sort(function (a, b) { return (b.startedAt ?? 0) - (a.startedAt ?? 0) })
     rows.forEach(function (j) {
       var el = document.createElement('div')
-      el.className = 'dsr-job st-' + j.status + (j.id === selectedJob ? ' sel' : '')
+      el.className = 'dsr-job st-' + j.status + (jobKey(j.id, j.agentId) === jobKey(selectedJob, selectedJobAgent) && selectedJob !== null ? ' sel' : '')
       var info
       if (j.status === 'running') info = '● ' + fmtElapsed(Date.now() - (j.startedAt ?? Date.now()))
       else if (j.status === 'killed') info = '⊘ killed'
@@ -374,7 +378,7 @@
     jobPartial = ''
     jobCursor = 0
     jobTerm.textContent = ''
-    var j = jobs.get(id)
+    var j = id !== null ? jobs.get(jobKey(id, agentId)) : undefined
     var stateEl = $c('#dsr-jd-state')
     if (j === undefined) {
       stateEl.textContent = '#' + id
@@ -501,7 +505,8 @@
 
   function refreshSessions() {
     var hint = currentTitleHint()
-    var url = '/ssh-remote-panel/sessions' + (hint !== '' ? '?titleHint=' + encodeURIComponent(hint) : '')
+    var qs = standalone ? 'all=1' : (hint !== '' ? 'titleHint=' + encodeURIComponent(hint) : '')
+    var url = '/ssh-remote-panel/sessions' + (qs !== '' ? '?' + qs : '')
     return fetch(url, { cache: 'no-store' })
       .then(function (r) { return r.json() })
       .then(function (data) {
@@ -552,11 +557,16 @@
   }
 
   function refreshJobs() {
-    return fetch('/ssh-remote-panel/jobs', { cache: 'no-store' })
+    // Same scoping as /sessions: the standalone page sees everything; an
+    // embedded panel scopes to the current conversation's workspace.
+    var hint = currentTitleHint()
+    var url = '/ssh-remote-panel/jobs'
+      + (standalone ? '?all=1' : (hint !== '' ? '?titleHint=' + encodeURIComponent(hint) : ''))
+    return fetch(url, { cache: 'no-store' })
       .then(function (r) { return r.json() })
       .then(function (rows) {
         jobs = new Map()
-        ;(rows || []).forEach(function (j) { jobs.set(j.id, j) })
+        ;(rows || []).forEach(function (j) { jobs.set(jobKey(j.id, j.agentId), j) })
         var running = 0
         jobs.forEach(function (j) { if (j.status === 'running') running += 1 })
         var badge = $c('#dsr-jobbadge')
@@ -564,7 +574,7 @@
         badge.style.display = running > 0 ? '' : 'none'
         renderJobsList()
         if (selectedJob !== null) {
-          var j = jobs.get(selectedJob)
+          var j = jobs.get(jobKey(selectedJob, selectedJobAgent))
           if (j !== undefined) {
             var stateEl = $c('#dsr-jd-state')
             stateEl.textContent = stateText(j)

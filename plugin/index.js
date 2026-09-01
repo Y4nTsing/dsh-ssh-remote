@@ -895,7 +895,7 @@ async function sessionTitleCatalog(ctx) {
     for (const record of records) {
       const id = record?.header?.id
       if (typeof id !== 'string' || id.length === 0) continue
-      entries.push({ id, preset: record.header.agentPreset ?? '', live: record.live === true, title: '' })
+      entries.push({ id, preset: record.header.agentPreset ?? '', live: record.live === true, cwd: record.header.cwd ?? null, title: '' })
     }
     if (entries.length === 0) return null
     const observations = await query.readTitleSnapshots(entries.map((e) => e.id)).catch(() => [])
@@ -923,7 +923,7 @@ async function resolveCurrentSessionId(ctx, hint) {
     if (pool.length === 0) pool = entries.filter((e) => e.title !== '' && (needle.includes(e.title) || e.title.includes(needle)))
     if (pool.length === 0) return null
     pool.sort((a, b) => (Number(b.live) - Number(a.live)))
-    return { id: pool[0].id }
+    return { id: pool[0].id, cwd: pool[0].cwd }
   } catch {
     return null
   }
@@ -945,16 +945,29 @@ function sessionRunsSshRemote(ctx, sessionId) {
   }
 }
 
-/** Live ssh-remote sessions: journal + connection state merged per agent. */
-async function panelSessions(ctx = null, titleHint = '') {
+/** Live ssh-remote sessions: journal + connection state merged per agent.
+ * Workspace-scoped by default: the panel inside a conversation sees ONLY the
+ * journals of sessions in the SAME workspace (isolation between workspaces);
+ * the standalone operator page requests scope=all explicitly. */
+async function panelSessions(ctx = null, titleHint = '', scopeAll = false) {
+  // Resolve the current conversation first — its workspace is the scope.
+  const matched = await resolveCurrentSessionId(ctx, titleHint)
+  let scopeWs = null
+  if (!scopeAll && matched !== null && typeof matched.cwd === 'string' && matched.cwd.length > 0) {
+    scopeWs = pathResolve(matched.cwd)
+  }
+  const inScope = (ws) => scopeWs === null || (typeof ws === 'string' && pathResolve(ws) === scopeWs)
+
   const rows = new Map()
   // Disk discovery first: every journal file that ever existed, including
   // sessions from before a restart and sessions whose connection is gone.
   for (const disk of await discoverDiskSessions(ctx)) {
+    if (!inScope(disk.workspace)) continue
     rows.set(disk.transcriptFile, disk)
   }
   // Live state wins for the same file: it knows the connection.
   for (const [agentId, st] of transcripts) {
+    if (!inScope(st.workspace)) continue
     const row = rows.get(st.file) ?? {
       agentId,
       workspace: st.workspace,
@@ -969,18 +982,20 @@ async function panelSessions(ctx = null, titleHint = '') {
     rows.set(st.file, row)
   }
   for (const [agentId, conn] of connections) {
-    let matched = false
+    const st = transcripts.get(agentId)
+    if (st !== undefined && !inScope(st.workspace)) continue
+    let matchedRow = false
     for (const row of rows.values()) {
       if (row.agentId === agentId && row.historical === false) {
         row.connected = true
         row.userAtHost = `${conn.info.username}@${conn.info.host}:${conn.info.port}`
-        matched = true
+        matchedRow = true
       }
     }
-    if (!matched) {
+    if (!matchedRow && (st === undefined || inScope(st.workspace))) {
       rows.set(`live:${agentId}`, {
         agentId,
-        workspace: null,
+        workspace: st !== undefined ? st.workspace : null,
         transcriptFile: null,
         connected: true,
         userAtHost: `${conn.info.username}@${conn.info.host}:${conn.info.port}`,
@@ -1011,9 +1026,8 @@ async function panelSessions(ctx = null, titleHint = '') {
   // session runs the ssh-remote preset. No global fallback: "any connected
   // ssh session" would show the tab in every conversation. An unmatched
   // breadcrumb (blank conversation, non-ssh conversation) means hidden.
-  const matched = await resolveCurrentSessionId(ctx, titleHint)
   let currentId = matched !== null ? matched.id : null
-  let currentIsSsh = currentId !== null && sessionRunsSshRemote(ctx, currentId)
+  const currentIsSsh = currentId !== null && sessionRunsSshRemote(ctx, currentId)
   if (currentId !== null && !currentIsSsh) currentId = null
   if (currentId !== null) {
     const currentTag = safeId(currentId)
@@ -1025,7 +1039,7 @@ async function panelSessions(ctx = null, titleHint = '') {
       }
     }
   }
-  return { rows: capped, currentIsSsh }
+  return { rows: capped, currentIsSsh, scopeWorkspace: scopeWs }
 }
 
 /** Transcript tail by character offset; the panel keeps its own cursor. */
@@ -1178,16 +1192,24 @@ async function historicalJobs(row) {
 }
 
 /** Merged job rows: live registry first, then history for unseen ids. */
-async function allJobRows(ctx, agentFilter) {
-  const rows = panelJobRows(agentFilter)
-  const seen = new Set(rows.map((r) => r.id))
-  const { rows: sessions } = await panelSessions(ctx)
+async function allJobRows(ctx, agentFilter, titleHint = '', scopeAll = false) {
+  const { rows: sessions, scopeWorkspace } = await panelSessions(ctx, titleHint, scopeAll)
+  const inWs = (agentId) => {
+    if (scopeWorkspace === null) return true
+    const st = transcripts.get(agentId)
+    return st !== undefined && pathResolve(st.workspace) === scopeWorkspace
+  }
+  // Job ids are per-process counters (every session's first job is ssh-1),
+  // so identity across sessions is agentId/id, never the bare id.
+  const rows = panelJobRows(agentFilter).filter((r) => inWs(r.agentId))
+  const seen = new Set(rows.map((r) => `${r.agentId}/${r.id}`))
   for (const session of sessions.slice(0, 15)) {
     if (typeof session.transcriptFile !== 'string') continue
     for (const h of await historicalJobs(session)) {
-      if (seen.has(h.id)) continue
       if (agentFilter !== null && h.agentId !== agentFilter) continue
-      seen.add(h.id)
+      const key = `${h.agentId}/${h.id}`
+      if (seen.has(key)) continue
+      seen.add(key)
       rows.push(h)
     }
   }
@@ -1293,8 +1315,9 @@ function makePanelHandler(ctx) {
       if (segment === 'sessions') {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' })
         const hint = url.searchParams.get('titleHint') ?? ''
-        const { rows, currentIsSsh } = await panelSessions(ctx, hint)
-        return sendJson(res, 200, { sessions: rows, currentIsSsh })
+        const scopeAll = url.searchParams.get('all') === '1'
+        const { rows, currentIsSsh, scopeWorkspace } = await panelSessions(ctx, hint, scopeAll)
+        return sendJson(res, 200, { sessions: rows, currentIsSsh, scopeWorkspace })
       }
       if (segment === 'transcript') {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' })
@@ -1313,7 +1336,9 @@ function makePanelHandler(ctx) {
       if (segment === 'jobs') {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' })
         const agent = url.searchParams.get('agent')
-        return sendJson(res, 200, await allJobRows(ctx, agent === null || agent === '' ? null : agent))
+        const hint = url.searchParams.get('titleHint') ?? ''
+        const scopeAll = url.searchParams.get('all') === '1'
+        return sendJson(res, 200, await allJobRows(ctx, agent === null || agent === '' ? null : agent, hint, scopeAll))
       }
       if (segment === 'job') {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' })

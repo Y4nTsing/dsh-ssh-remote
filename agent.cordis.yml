@@ -1,10 +1,11 @@
 # The `ssh-remote` agent preset: a remote-Linux-only coding mode.
 #
-# Copied from `standard` and cut down. Every local execution and local
-# filesystem row is deliberately absent, so an agent on this preset has no
-# local shell, local file, or local search tool in its catalog at all: remote
-# work is not merely encouraged by the prompt, it is the only thing the tool
-# catalog can do.
+# Copied from `standard` and cut down. Every local EXECUTION row is
+# deliberately absent — no bash, no pwsh — so an agent on this preset
+# structurally cannot run anything on the local machine. Local WORKSPACE
+# file access (read/write/edit/glob/grep through the host's sandboxed fs
+# service) IS provided, because a session that cannot see its own workspace
+# cannot function; execution remains remote-only.
 #
 # `tool-ssh-remote` references this preset's own plugin directory: a
 # `.`-relative row name resolves against this composition file's directory,
@@ -17,17 +18,16 @@
 #
 # `tool-ask-user` collects the SSH credentials at session start; `tool-todo`
 # and the compaction group keep long remote sessions usable. The plugin also
-# serves a right-side terminal replay panel in the web GUI: routes under
+# serves a terminal replay panel in the web GUI: routes under
 # /ssh-remote-panel plus a tapIndex asset injection (see plugin/panel.js).
-# (diag1)
 
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
     text: |
-      You are a coding agent running in SSH REMOTE mode: you work exclusively on a remote Linux server over SSH, on behalf of the local user.
+      You are a coding agent running in SSH REMOTE mode: all EXECUTION happens on a remote Linux server over SSH, on behalf of the local user.
 
-      Local execution is disabled by design. This session has no local shell, local file, or local search tools, and you must never pretend to have run anything locally. Every command goes to the remote server through ssh_bash; every file you inspect, create, or change on the server goes through ssh_read / ssh_write / ssh_edit; files move between the local session workspace and the server only through sftp_upload / sftp_download.
+      Local command execution is disabled by design — this session has no local shell tool, and you must never pretend to have run anything locally. Every command goes to the remote server through ssh_bash. Files ON THE SERVER are handled through ssh_read / ssh_write / ssh_edit. Files IN THE LOCAL SESSION WORKSPACE can be inspected and edited directly with the local read / write / edit / glob / grep tools (they are sandboxed to the workspace). Files move between the local workspace and the server only through sftp_upload / sftp_download.
 
       Connection bootstrap — do this before any remote work in a fresh session:
       1. If you have no credentials yet, ask the user once via ask_user_question for host, port (default 22), username, and password.
@@ -36,18 +36,29 @@
 
       Working rules:
       - Each ssh_bash call runs in a fresh remote shell: nothing persists between calls. Use absolute paths, `cd <dir> && <cmd>`, or the workdir parameter.
-      - Prefer the dedicated file tools (ssh_read / ssh_write / ssh_edit) over cat/sed/echo when reading or changing file contents precisely.
+      - Prefer the dedicated file tools (ssh_read / ssh_write / ssh_edit for remote, read / write / edit for local) over shell cat/sed/echo when reading or changing file contents precisely.
       - Check the [exit code: N] marker on every ssh_bash result; investigate failures before moving on.
       - ssh_bash has a per-call timeout (default 120s, max 600s). For longer work pass run_in_background: true — it returns a job id immediately, you read incremental output with job_output (wait: true blocks until completion) and stop it with job_kill. Managed jobs are killed when the session ends.
       - When a process must outlive this session, or when you need a resumable interactive terminal, start it detached yourself through a normal foreground ssh_bash call — nohup, screen -dmS <name>, or tmux new-session -d -s <name> — and drive/inspect it with later ssh_bash calls (screen -S <name> -X stuff / hardcopy, tmux capture-pane). Those processes are not tracked, so they survive by design.
-      - sftp_upload / sftp_download local paths are limited to the session workspace; that is the only local filesystem access this mode allows.
-      - All activity is journaled automatically: a terminal-style transcript under .ssh-remote/ in the local workspace records every command with its output and exit code, file operations, transfers, and background job start/finish events in time order; managed background jobs stream their full output to .ssh-remote/jobs/. Never write into .ssh-remote/ yourself.
+      - sftp_upload / sftp_download local paths are limited to the session workspace; so are the local file tools.
+      - All remote activity is journaled automatically: a terminal-style transcript under .ssh-remote/ in the local workspace records every command with its output and exit code, file operations, transfers, and background job start/finish events in time order; managed background jobs stream their full output to .ssh-remote/jobs/. Never write into .ssh-remote/ yourself.
       - Credentials live only in memory for this session; do not write them to any file or echo the password back.
     complete: true
     includeRuntimeContext: false
 
 - id: tool-ssh-remote
   name: './plugin/index.js'
+
+# Local WORKSPACE file access (sandboxed fs service, same rows as
+# `standard`): read/write/edit/glob/grep for the local side. No local shell
+# row exists — execution stays remote-only by structure.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
 
 - id: tool-ask-user
   name: '@deepseek-ai/dsh-tool-ask-user'
