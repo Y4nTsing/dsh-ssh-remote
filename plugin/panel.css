@@ -1,0 +1,227 @@
+/* ssh-remote preset — terminal panel styles. The content component lives
+ * either inside the floating panel (#dsr-panel-root) or inside the embedded
+ * conversation tab (#dsr-embed); every rule is prefixed so nothing leaks
+ * into the host GUI. */
+
+#dsr-panel-root { all: initial; }
+#dsr-embed { all: initial; }
+
+/* The panel exists only where ssh-remote sessions (live or historical) do. */
+#dsr-panel-root:not(.available) { display: none !important; }
+
+/* Floating host */
+#dsr-panel-root #dsr-panel {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 460px;
+  display: none;
+  flex-direction: column;
+  background: #0d1117;
+  border-left: 1px solid #30363d;
+  box-shadow: -8px 0 24px rgba(0,0,0,.45);
+  z-index: 2147483000;
+  font-family: -apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+}
+#dsr-panel-root.open #dsr-panel { display: flex; }
+#dsr-panel-root.embedded #dsr-panel,
+#dsr-panel-root.embedded #dsr-edge { display: none !important; }
+
+#dsr-panel-root #dsr-grip {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; background: transparent; z-index: 2;
+}
+#dsr-panel-root #dsr-grip:hover { background: #58a6ff; }
+
+#dsr-panel-root .dsr-floatbar {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  height: 34px; padding: 0 10px 0 16px;
+  background: #161b22; border-bottom: 1px solid #30363d;
+  font-size: 12px; color: #c9d1d9;
+}
+#dsr-panel-root .dsr-title { font-weight: 600; letter-spacing: .5px; }
+#dsr-panel-root #dsr-edge {
+  position: fixed; right: 0; top: 50%; transform: translateY(-50%);
+  display: none;
+  writing-mode: vertical-rl;
+  padding: 12px 5px;
+  background: #161b22; color: #58a6ff;
+  border: 1px solid #30363d; border-right: none;
+  border-radius: 8px 0 0 8px;
+  font-size: 12px; letter-spacing: 2px; cursor: pointer;
+  z-index: 2147483000;
+  font-family: -apple-system,'Segoe UI','PingFang SC',sans-serif;
+}
+#dsr-panel-root:not(.open):not(.embedded) #dsr-edge { display: block; }
+
+/* Embedded host: stays in normal flow; height is computed inline by
+ * panel.js (host content height − header height), so it fills exactly the
+ * remaining conversation area in any parent layout kind. */
+#dsr-embed {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  overflow: hidden;
+  background: #0d1117;
+  font-family: -apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+}
+
+/* ---------- shared content ---------- */
+:is(#dsr-panel-root, #dsr-embed) #dsr-content {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0; min-width: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: #c9d1d9;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-spacer { flex: 1; }
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-head {
+  flex: none;
+  display: flex; align-items: center; gap: 8px;
+  height: 38px; padding: 0 10px;
+  background: #161b22; border-bottom: 1px solid #30363d;
+  font-size: 12px; color: #c9d1d9;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-conn {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: #8b949e; white-space: nowrap;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-conn i {
+  width: 8px; height: 8px; border-radius: 50%; background: #f85149;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-conn.on i { background: #3fb950; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-conn em {
+  font-style: normal; font-family: ui-monospace,Consolas,monospace;
+}
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content select {
+  font-size: 11px; color: #c9d1d9; background: #0d1117;
+  border: 1px solid #30363d; border-radius: 6px; padding: 3px 5px;
+  min-width: 0;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-session { flex: 1.6; max-width: 300px; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jump { flex: 1; max-width: 200px; }
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content button {
+  font-size: 11px; color: #c9d1d9; background: #21262d;
+  border: 1px solid #30363d; border-radius: 6px;
+  padding: 3px 9px; cursor: pointer; white-space: nowrap;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content button:hover { border-color: #58a6ff; color: #58a6ff; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content button.on {
+  background: #1f3a5f; border-color: #58a6ff; color: #58a6ff;
+}
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-subtabs {
+  flex: none;
+  display: flex; align-items: stretch; gap: 2px;
+  height: 30px; padding: 0 8px;
+  background: #10151c; border-bottom: 1px solid #30363d;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-subtab {
+  display: flex; align-items: center; gap: 5px;
+  padding: 0 10px; cursor: pointer; user-select: none;
+  color: #8b949e; font-size: 12px; white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-subtab:hover { color: #c9d1d9; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-subtab.active {
+  color: #e6edf3; border-bottom-color: #58a6ff;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-badge {
+  font-family: ui-monospace,Consolas,monospace; font-size: 10px;
+  padding: 0 6px; border-radius: 8px;
+  background: #233627; color: #3fb950;
+}
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-bodies {
+  flex: 1; min-height: 0; position: relative; display: flex;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-body {
+  display: none; flex: 1; min-height: 0; flex-direction: column;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-body.active { display: flex; }
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-term {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 8px 12px;
+  font-family: 'JetBrains Mono','Cascadia Code',ui-monospace,Menlo,Consolas,'Courier New',monospace;
+  font-size: 12px; line-height: 1.5;
+  color: #c9d1d9; white-space: pre-wrap; word-break: break-all;
+  outline: none;
+}
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-l { min-height: 1em; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-ts { color: #484f58; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-banner { color: #39c5cf; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-note { color: #8b949e; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-ok { color: #8b949e; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-dim { color: #8b949e; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-err { color: #f85149; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-bg { color: #d29922; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-dollar { color: #3fb950; font-weight: 700; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-cmd { color: #e6edf3; font-weight: 600; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-prompt { background: rgba(88,166,255,.05); }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-l[data-job] { cursor: pointer; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-l[data-job]:hover {
+  text-decoration: underline; background: rgba(210,153,34,.12);
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-l.dsr-flash { animation: dsrflash 1.8s ease-out; }
+@keyframes dsrflash {
+  0% { background: rgba(88,166,255,.5); }
+  60% { background: rgba(88,166,255,.18); }
+  100% { background: transparent; }
+}
+
+/* ---------- jobs ---------- */
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-jobs-list {
+  flex: none; max-height: 38%; min-height: 56px;
+  overflow-y: auto; padding: 6px 8px;
+  border-bottom: 1px solid #21262d;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-jobs-empty {
+  color: #8b949e; font-size: 12px; padding: 10px 4px;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; margin-bottom: 4px; border-radius: 6px;
+  font-size: 12px; cursor: pointer;
+  font-family: ui-monospace,Consolas,monospace;
+  border: 1px solid transparent;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job:hover { background: #161b22; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job.sel { border-color: #58a6ff; background: #12233a; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job b { color: #39c5cf; font-weight: 600; flex: none; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job .dsr-jcmd {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job .dsr-jinfo { flex: none; color: #8b949e; font-size: 11px; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job.st-running .dsr-jinfo { color: #3fb950; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job.st-killed .dsr-jinfo,
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job.st-failed .dsr-jinfo { color: #f85149; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job button { flex: none; font-size: 11px; padding: 1px 8px; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job-detail {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content .dsr-job-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-bottom: 1px solid #21262d;
+  font-size: 12px; font-family: ui-monospace,Consolas,monospace;
+}
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-state { font-weight: 600; color: #8b949e; flex: none; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-state.st-running { color: #3fb950; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-state.st-killed,
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-state.st-failed { color: #f85149; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-state.st-completed { color: #3fb950; }
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-jd-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+:is(#dsr-panel-root, #dsr-embed) #dsr-content #dsr-bottom {
+  position: absolute; right: 18px; bottom: 14px; display: none;
+  font-size: 12px; padding: 4px 12px; border-radius: 14px;
+  background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+  box-shadow: 0 2px 8px rgba(0,0,0,.5); z-index: 3;
+}
