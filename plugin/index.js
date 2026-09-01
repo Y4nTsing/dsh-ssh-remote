@@ -39,6 +39,12 @@ const MAX_READ_BYTES = 8 * 1024 * 1024
 const DEFAULT_READ_LIMIT = 2000
 const KEEPALIVE_INTERVAL_MS = Number(process.env.DSH_SSH_KEEPALIVE_INTERVAL_MS) || 15_000
 const KEEPALIVE_COUNT_MAX = Number(process.env.DSH_SSH_KEEPALIVE_COUNT_MAX) || 6
+/** Extra wait after the exec timeout before declaring the connection dead
+ * (covers the gap where ssh2's callback never fires at all). */
+const EXEC_NO_RESPONSE_GRACE_MS = Number(process.env.DSH_SSH_EXEC_GRACE_MS) || 5_000
+/** How long a liveness probe (a no-op `true`) may take before the connection
+ * is treated as dead and re-established. */
+const PROBE_TIMEOUT_MS = Number(process.env.DSH_SSH_PROBE_TIMEOUT_MS) || 10_000
 
 /** One session's SSH connection state; keyed by the calling agent's id. */
 const connections = new Map()
@@ -66,22 +72,29 @@ function requireAgentId(exec) {
 /** Remote background jobs this plugin is currently observing, by agent. */
 const activeJobs = new Set()
 
-/** Close and forget one session's connection (idempotent). */
+/** Close and forget one session's connection (idempotent). Background jobs are
+ * NOT stopped here: a transient drop must not kill a detached remote job —
+ * the polling loop reconnects on its own and resumes it. Jobs are stopped
+ * explicitly by stopAgentJobs (agent disposal) and closeAllConnections. */
 function closeConnection(agentId) {
   const conn = connections.get(agentId)
   if (conn === undefined) return
   connections.delete(agentId)
   conn.sftp = null
+  try {
+    conn.client.end()
+  } catch {
+    // already gone
+  }
+}
+
+/** Stop every managed remote job observed for one agent. */
+function stopAgentJobs(agentId) {
   for (const job of [...activeJobs]) {
     if (job.agentId !== agentId) continue
     try {
       job.stop()
     } catch {}
-  }
-  try {
-    conn.client.end()
-  } catch {
-    // already gone
   }
 }
 
@@ -220,7 +233,7 @@ function startRemoteBackgroundJob(agentId, command, transcript = null, meta = nu
       // Transparent auto-reconnect on every poll: a dropped connection no
       // longer kills a still-running remote job — the detached setsid process
       // survives the disconnect and polling simply resumes on a fresh channel.
-      await ensureConnected(agentId)
+      await ensureAlive(agentId)
       const result = await remoteExec(agentId, pollCommand(cursor), { timeoutMs: 15_000 })
       failures = 0
       const marker = result.stdout.indexOf(POLL_MARKER)
@@ -419,6 +432,32 @@ async function ensureConnected(agentId, signal) {
   }
 }
 
+/** Make sure the session has a LIVE connection before a remote operation.
+ * `connections.has()` alone is not enough: a silently dropped TCP connection
+ * can linger in the map until ssh2's keepalive notices (up to ~90s), which is
+ * exactly the window where SFTP operations used to hang and time out. A
+ * cheap no-op exec probe (bounded by PROBE_TIMEOUT_MS, plus the exec outer
+ * guard) detects that stale entry immediately and routes through the normal
+ * auto-reconnect path, then re-probes once. Returns once the probe answers. */
+async function ensureAlive(agentId, signal) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await ensureConnected(agentId, signal)
+    try {
+      const probe = await remoteExec(agentId, 'true', { timeoutMs: PROBE_TIMEOUT_MS, signal })
+      if (probe.timedOut) throw new Error('probe timed out')
+      if (probe.exitCode !== 0) throw new Error(`probe exited ${probe.exitCode}: ${probe.stderr.trim().slice(0, 200)}`)
+      return
+    } catch (error) {
+      // A cancelled tool call must abort immediately, never look like a
+      // connection failure. Everything else means the transport is not
+      // answering (stale entry or wedged channel): force a reconnect.
+      if (signal?.aborted || (error?.message ?? '') === 'aborted') throw error
+      closeConnection(agentId)
+    }
+  }
+  throw new Error('SSH: connection probe failed twice — the server is not answering. Run ssh_connect again.')
+}
+
 /**
  * Run one command on the session's connection. Fresh shell per call; output
  * streams keep their tail under STREAM_CAP_CHARS with a truncated flag.
@@ -435,8 +474,30 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
     let errTruncated = false
     let timedOut = false
     let settled = false
+    let started = false
+    // Outer guard: on a half-open/dead connection the exec callback may never
+    // fire (the inner timer only starts once a stream exists), which would
+    // hang this promise forever. Bound it, forget the suspect connection, and
+    // let the caller's self-heal reconnect.
+    const outer = setTimeout(() => {
+      if (settled || started) return
+      settled = true
+      closeConnection(agentId)
+      reject(new Error(
+        `SSH: no response from the server within ${timeoutMs + EXEC_NO_RESPONSE_GRACE_MS}ms — the connection is probably dead`
+        + (lastCreds.has(agentId)
+          ? ' and will be re-established automatically on the next operation.'
+          : '; run ssh_connect again.'),
+      ))
+    }, timeoutMs + EXEC_NO_RESPONSE_GRACE_MS)
     conn.client.exec(command, (err, stream) => {
-      if (err) return reject(err)
+      if (settled) return
+      started = true
+      if (err) {
+        clearTimeout(outer)
+        reject(err)
+        return
+      }
       let timer = null
       const kill = (byTimeout) => {
         if (timedOut) return
@@ -453,6 +514,7 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
         if (settled) return
         settled = true
         if (timer !== null) clearTimeout(timer)
+        clearTimeout(outer)
         signal?.removeEventListener('abort', onAbort)
       }
       stream.stdout.setEncoding('utf8')
@@ -514,33 +576,53 @@ function withTimeout(promise, ms, label) {
   })
 }
 
-async function getSftp(agentId) {
-  const conn = connections.get(agentId)
-  if (conn === undefined) throw notConnectedError()
-  if (conn.sftp === null) {
-    conn.sftp = withTimeout(new Promise((resolve, reject) => {
-      conn.client.sftp((error, sftp) => {
-        if (error) reject(error)
-        else resolve(sftp)
-      })
-    }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel').catch((error) => {
-      conn.sftp = null
-      throw error
-    })
-  }
-  return conn.sftp
+/** Is this error caused by a dead/wedged transport as opposed to a normal
+ * remote error (no such file, permission denied, ...)? Matched on message
+ * text because ssh2 surfaces connection failures as plain Error objects. */
+function isConnectionFailure(error) {
+  const msg = String(error?.message ?? '')
+  return /timed out|probably dead|no response|socket|channel|ECONN|ETIMEDOUT|connection (lost|closed|reset|refused)|closed by remote|read ECONN/i.test(msg)
 }
 
-async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS) {
-  const sftp = await getSftp(agentId)
+/** Open a FRESH SFTP channel for one operation, then close it. No channel is
+ * reused across operations (a wedged channel from a dead connection can no
+ * longer poison the next call), and the open itself is hard-timeout-bounded. */
+async function openFreshSftp(agentId) {
   const conn = connections.get(agentId)
-  try {
-    return await withTimeout(operation(sftp), timeoutMs, 'SFTP operation')
-  } catch (error) {
-    // The channel is suspect after any failure (timeout included); reopen
-    // it on the next call.
-    if (conn !== undefined) conn.sftp = null
-    throw error
+  if (conn === undefined) throw notConnectedError()
+  return withTimeout(new Promise((resolve, reject) => {
+    conn.client.sftp((error, sftp) => {
+      if (error) reject(error)
+      else resolve(sftp)
+    })
+  }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel')
+}
+
+/** Run one SFTP operation on a fresh channel with a hard timeout and ONE
+ * automatic retry: if the operation (or the channel open) fails for a
+ * connection-caused reason, tear the connection down, reconnect via
+ * ensureAlive, and run the operation once more on a brand-new channel. This
+ * is what makes a silently dropped SSH connection invisible to the model —
+ * the call succeeds on the retry instead of erroring after a 60s hang. */
+async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS) {
+  let attempt = 0
+  for (;;) {
+    let sftp
+    try {
+      sftp = await openFreshSftp(agentId)
+      return await withTimeout(operation(sftp), timeoutMs, 'SFTP operation')
+    } catch (error) {
+      if (!isConnectionFailure(error) || attempt >= 1) throw error
+      attempt += 1
+      closeConnection(agentId)
+      await ensureAlive(agentId)
+    } finally {
+      if (sftp !== undefined) {
+        try {
+          sftp.end()
+        } catch {}
+      }
+    }
   }
 }
 
@@ -582,7 +664,7 @@ function sftpWriteText(agentId, remotePath, content) {
 async function sftpEnsureRemoteDir(agentId, remotePath) {
   const parent = posix.dirname(remotePath)
   if (parent === '' || parent === '.' || parent === remotePath) return
-  await remoteExec(agentId, `mkdir -p -- ${shQuote(parent)}`).catch(() => {})
+  await remoteExec(agentId, `mkdir -p -- ${shQuote(parent)}`, { timeoutMs: 15_000 }).catch(() => {})
 }
 
 function sftpFastPut(agentId, localPath, remotePath) {
@@ -1663,7 +1745,7 @@ function apply(ctx) {
       const command = String(args.command)
       if (command.trim().length === 0) throw new Error('invalid command: expected a non-empty string')
       const timeoutMs = parsePositiveInt(args.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, { max: MAX_EXEC_TIMEOUT_MS })
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       let fullCommand = command
       if (args.workdir !== undefined && args.workdir !== null) {
         const workdir = String(args.workdir)
@@ -1811,7 +1893,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       const path = String(args.path)
       const offset = parsePositiveInt(args.offset, 1)
       const limit = parsePositiveInt(args.limit, DEFAULT_READ_LIMIT)
@@ -1887,7 +1969,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       const path = String(args.path)
       const content = String(args.content)
       await sftpEnsureRemoteDir(agentId, path)
@@ -1938,7 +2020,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       const path = String(args.path)
       const oldString = String(args.old_string)
       const newString = String(args.new_string)
@@ -2009,7 +2091,7 @@ function apply(ctx) {
       const agentId = requireAgentId(exec)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
       const remotePath = String(args.remote_path)
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       const stats = await fsStat(localPath).catch(() => {
         throw new Error(`local file not found: ${localPath}`)
       })
@@ -2060,7 +2142,7 @@ function apply(ctx) {
       const agentId = requireAgentId(exec)
       const remotePath = String(args.remote_path)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
-      await ensureConnected(agentId, exec.signal)
+      await ensureAlive(agentId, exec.signal)
       const stats = await sftpStat(agentId, remotePath).catch((error) => {
         throw new Error(`cannot stat remote file ${remotePath}: ${error.message}`)
       })
@@ -2090,6 +2172,7 @@ function apply(ctx) {
       if (state !== undefined) {
         writeTranscript(state, `=== [${localStamp()}] session ended; connection closed — transcript ends ===\n`)
       }
+      stopAgentJobs(id)
       closeConnection(id)
       lastCreds.delete(id)
       reconnectInFlight.delete(id)
