@@ -2,3 +2,4 @@ node_modules/
 panel-debug.log
 *.log
 .ssh-remote/
+.gcm-read.cjs

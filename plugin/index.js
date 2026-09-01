@@ -37,8 +37,8 @@ const MAX_EXEC_TIMEOUT_MS = 600_000
 const STREAM_CAP_CHARS = 512 * 1024
 const MAX_READ_BYTES = 8 * 1024 * 1024
 const DEFAULT_READ_LIMIT = 2000
-const KEEPALIVE_INTERVAL_MS = 15_000
-const KEEPALIVE_COUNT_MAX = 6
+const KEEPALIVE_INTERVAL_MS = Number(process.env.DSH_SSH_KEEPALIVE_INTERVAL_MS) || 15_000
+const KEEPALIVE_COUNT_MAX = Number(process.env.DSH_SSH_KEEPALIVE_COUNT_MAX) || 6
 
 /** One session's SSH connection state; keyed by the calling agent's id. */
 const connections = new Map()
@@ -217,6 +217,10 @@ function startRemoteBackgroundJob(agentId, command, transcript = null, meta = nu
   const poll = async () => {
     if (finished) return
     try {
+      // Transparent auto-reconnect on every poll: a dropped connection no
+      // longer kills a still-running remote job — the detached setsid process
+      // survives the disconnect and polling simply resumes on a fresh channel.
+      await ensureConnected(agentId)
       const result = await remoteExec(agentId, pollCommand(cursor), { timeoutMs: 15_000 })
       failures = 0
       const marker = result.stdout.indexOf(POLL_MARKER)
@@ -349,6 +353,70 @@ function openConnection({ host, port, username, password, timeoutMs }, signal) {
       keepaliveCountMax: KEEPALIVE_COUNT_MAX,
     })
   })
+}
+
+/** In-memory credentials per session for TRANSPARENT AUTO-RECONNECT: the
+ * connection to cloud servers drops every few idle minutes (NAT/sshd
+ * policies), and with the credentials already in memory the next tool call
+ * can simply re-establish instead of erroring until the model re-runs
+ * ssh_connect. Same trust boundary as before: memory only, never on disk. */
+const lastCreds = new Map()
+const reconnectInFlight = new Map()
+
+/** Establish (or re-establish) the connection entry for one session. */
+async function establishConnection(agentId, creds, signal) {
+  const client = await openConnection(creds, signal)
+  const conn = {
+    client,
+    info: { host: creds.host, port: creds.port, username: creds.username },
+    sftp: null,
+  }
+  client.on('error', onLost)
+  client.on('close', onLost)
+  try {
+    client.sock?.setKeepAlive?.(true, 45_000)
+  } catch {}
+  connections.set(agentId, conn)
+  return conn
+
+  function onLost() {
+    // Only tear down the map entry when it still points at THIS client: a
+    // late error/close from a superseded connection must not delete the
+    // replacement that is already live.
+    const current = connections.get(agentId)
+    if (current !== undefined && current.client === client) closeConnection(agentId)
+  }
+}
+
+/** Make sure a live connection exists, reconnecting with stored credentials
+ * when a previous one dropped. Concurrent callers share one reconnect. */
+async function ensureConnected(agentId, signal) {
+  if (connections.has(agentId)) return
+  const creds = lastCreds.get(agentId)
+  if (creds === undefined) throw notConnectedError()
+  let pending = reconnectInFlight.get(agentId)
+  if (pending === undefined) {
+    pending = (async () => {
+      closeConnection(agentId)
+      const conn = await establishConnection(agentId, creds, signal)
+      const st = transcripts.get(agentId)
+      if (st !== undefined) {
+        writeTranscript(st, transcriptNote(`auto-reconnected to ${creds.username}@${creds.host}:${creds.port} after connection loss`))
+      }
+      return conn
+    })()
+      .finally(() => reconnectInFlight.delete(agentId))
+    reconnectInFlight.set(agentId, pending)
+  }
+  try {
+    await pending
+  } catch (error) {
+    throw new Error(
+      `SSH: the connection dropped and automatic reconnect to ${creds.username}@${creds.host}:${creds.port} failed: ${error?.message ?? String(error)}. `
+      + 'Retry ssh_connect with fresh credentials (ask the user via ask_user_question if the password may have changed).',
+      { cause: error },
+    )
+  }
 }
 
 /**
@@ -1505,16 +1573,10 @@ function apply(ctx) {
       const timeoutMs = parsePositiveInt(args.timeoutMs, CONNECT_TIMEOUT_MS, { max: 60_000 })
       if (host.length === 0) throw new Error('invalid host: expected a non-empty string')
       if (username.length === 0) throw new Error('invalid username: expected a non-empty string')
+      const creds = { host, port, username, password: String(args.password), timeoutMs }
       closeConnection(agentId)
-      const client = await openConnection({ host, port, username, password: String(args.password), timeoutMs }, exec.signal)
-      const conn = {
-        client,
-        info: { host, port, username },
-        sftp: null,
-      }
-      client.on('error', () => closeConnection(agentId))
-      client.on('close', () => closeConnection(agentId))
-      connections.set(agentId, conn)
+      lastCreds.set(agentId, creds)
+      await establishConnection(agentId, creds, exec.signal)
       // Verify the channel actually executes commands and capture identity.
       const probe = await remoteExec(agentId, 'printf %s "$HOME"; printf "\\n"; uname -a', { timeoutMs: 15_000, signal: exec.signal })
       if (probe.exitCode !== 0) {
@@ -1601,6 +1663,7 @@ function apply(ctx) {
       const command = String(args.command)
       if (command.trim().length === 0) throw new Error('invalid command: expected a non-empty string')
       const timeoutMs = parsePositiveInt(args.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, { max: MAX_EXEC_TIMEOUT_MS })
+      await ensureConnected(agentId, exec.signal)
       let fullCommand = command
       if (args.workdir !== undefined && args.workdir !== null) {
         const workdir = String(args.workdir)
@@ -1748,6 +1811,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
+      await ensureConnected(agentId, exec.signal)
       const path = String(args.path)
       const offset = parsePositiveInt(args.offset, 1)
       const limit = parsePositiveInt(args.limit, DEFAULT_READ_LIMIT)
@@ -1823,6 +1887,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
+      await ensureConnected(agentId, exec.signal)
       const path = String(args.path)
       const content = String(args.content)
       await sftpEnsureRemoteDir(agentId, path)
@@ -1873,6 +1938,7 @@ function apply(ctx) {
     timeoutMs: 120_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
+      await ensureConnected(agentId, exec.signal)
       const path = String(args.path)
       const oldString = String(args.old_string)
       const newString = String(args.new_string)
@@ -1943,6 +2009,7 @@ function apply(ctx) {
       const agentId = requireAgentId(exec)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
       const remotePath = String(args.remote_path)
+      await ensureConnected(agentId, exec.signal)
       const stats = await fsStat(localPath).catch(() => {
         throw new Error(`local file not found: ${localPath}`)
       })
@@ -1993,6 +2060,7 @@ function apply(ctx) {
       const agentId = requireAgentId(exec)
       const remotePath = String(args.remote_path)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
+      await ensureConnected(agentId, exec.signal)
       const stats = await sftpStat(agentId, remotePath).catch((error) => {
         throw new Error(`cannot stat remote file ${remotePath}: ${error.message}`)
       })
@@ -2023,6 +2091,8 @@ function apply(ctx) {
         writeTranscript(state, `=== [${localStamp()}] session ended; connection closed — transcript ends ===\n`)
       }
       closeConnection(id)
+      lastCreds.delete(id)
+      reconnectInFlight.delete(id)
     }
   })
 

@@ -19,6 +19,18 @@
 
 **本地（仅文件、无执行）**：`read` / `write` / `edit` / `glob` / `grep` —— 复用 DSH 官方沙箱化 fs 工具（`dsh-tool-fs` + `dsh-tool-fs-search`），限定在会话工作区内。会话需要看到本地工作区里有什么、就地编辑本地文件，但**组合里没有任何本地 shell 行**——本地命令执行在结构上不存在。
 
+### 连接稳定性（自动重连）
+
+云服务器（NAT / sshd 空闲策略）会静默断开几分钟未活动的 SSH 连接，导致工具调用报「无连接」。本模式内置**透明自动重连**：
+
+- `ssh_connect` 成功后，凭据只保留在进程内存（`lastCreds`，绝不落盘）；连接断开后，下一次任意工具调用（`ssh_bash` / `ssh_read` / `ssh_write` / `ssh_edit` / `sftp_upload` / `sftp_download`，含后台任务轮询）都会用内存凭据自动重建连接——不需要模型察觉到并重跑 `ssh_connect`
+- 重连是**逐个会话共享的**：同一时刻多个工具调用并发重连，只会发起一次握手
+- 每次重连成功在 journal 里记一行 `auto-reconnected to user@host:port after connection loss`；重连失败则给出明确报错并建议重跑 `ssh_connect`
+- **后台任务不受断开影响**：远端任务以 `setsid` 独立会话运行，SSH 断开时任务仍继续；轮询在每次心跳前自动重连，完成任务、安全结束
+- 可调 keepalive（环境变量覆盖，进程启动时读取）：`DSH_SSH_KEEPALIVE_INTERVAL_MS`（默认 `15000`）、`DSH_SSH_KEEPALIVE_COUNT_MAX`（默认 `6`，即约 90s 无响应判死）
+
+> 若自动重连仍失败（比如服务器重启后密码失效），报错会明确指向「重跑 `ssh_connect`」。
+
 ### 托管后台任务（`run_in_background`）
 
 - 远端以 `setsid` 独立会话启动，SSH 通道断开不影响进程
