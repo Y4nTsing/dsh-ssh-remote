@@ -422,31 +422,55 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
 }
 
 /** Lazily opened SFTP channel for one session's connection. */
+/** Hard timeouts for every SFTP wait. ssh2 callbacks on a dead connection
+ * or a wedged channel simply never fire, and a cached channel promise that
+ * never settles would hang every subsequent SFTP call forever ("卡死");
+ * racing a timer converts that into a recoverable error. Env-overridable for
+ * tests. */
+const SFTP_OPEN_TIMEOUT_MS = Number(process.env.DSH_SFTP_OPEN_TIMEOUT_MS) || 20_000
+const SFTP_OP_TIMEOUT_MS = Number(process.env.DSH_SFTP_OP_TIMEOUT_MS) || 60_000
+const SFTP_TRANSFER_TIMEOUT_MS = Number(process.env.DSH_SFTP_TRANSFER_TIMEOUT_MS) || 180_000
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms — the SFTP channel or the SSH connection is probably dead. Retry after ssh_connect.`))
+    }, ms)
+    promise.then((value) => {
+      clearTimeout(timer)
+      resolve(value)
+    }, (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
 async function getSftp(agentId) {
   const conn = connections.get(agentId)
   if (conn === undefined) throw notConnectedError()
   if (conn.sftp === null) {
-    conn.sftp = new Promise((resolve, reject) => {
+    conn.sftp = withTimeout(new Promise((resolve, reject) => {
       conn.client.sftp((error, sftp) => {
-        if (error) {
-          conn.sftp = null
-          reject(error)
-        } else {
-          resolve(sftp)
-        }
+        if (error) reject(error)
+        else resolve(sftp)
       })
+    }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel').catch((error) => {
+      conn.sftp = null
+      throw error
     })
   }
   return conn.sftp
 }
 
-async function sftpCall(agentId, operation) {
+async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS) {
   const sftp = await getSftp(agentId)
+  const conn = connections.get(agentId)
   try {
-    return await operation(sftp)
+    return await withTimeout(operation(sftp), timeoutMs, 'SFTP operation')
   } catch (error) {
-    // The channel is suspect after any failure; reopen it on the next call.
-    const conn = connections.get(agentId)
+    // The channel is suspect after any failure (timeout included); reopen
+    // it on the next call.
     if (conn !== undefined) conn.sftp = null
     throw error
   }
@@ -455,7 +479,7 @@ async function sftpCall(agentId, operation) {
 function sftpStat(agentId, remotePath) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
-  }))
+  }), 30_000)
 }
 
 function sftpReadText(agentId, remotePath, maxBytes) {
@@ -475,7 +499,7 @@ function sftpReadText(agentId, remotePath, maxBytes) {
     })
     stream.on('error', reject)
     stream.on('end', () => resolve({ text: chunks.join(''), truncated }))
-  }))
+  }), SFTP_OP_TIMEOUT_MS)
 }
 
 function sftpWriteText(agentId, remotePath, content) {
@@ -484,7 +508,7 @@ function sftpWriteText(agentId, remotePath, content) {
     stream.on('error', reject)
     stream.on('close', () => resolve())
     stream.end(content)
-  }))
+  }), SFTP_OP_TIMEOUT_MS)
 }
 
 async function sftpEnsureRemoteDir(agentId, remotePath) {
@@ -496,13 +520,13 @@ async function sftpEnsureRemoteDir(agentId, remotePath) {
 function sftpFastPut(agentId, localPath, remotePath) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.fastPut(localPath, remotePath, (error) => (error ? reject(error) : resolve()))
-  }))
+  }), SFTP_TRANSFER_TIMEOUT_MS)
 }
 
 function sftpFastGet(agentId, remotePath, localPath) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.fastGet(remotePath, localPath, (error) => (error ? reject(error) : resolve()))
-  }))
+  }), SFTP_TRANSFER_TIMEOUT_MS)
 }
 
 /** Local-side guard: resolve within the session workspace and reject escapes. */
