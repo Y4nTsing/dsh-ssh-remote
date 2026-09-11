@@ -1,18 +1,24 @@
 /* dsh-plugin-ssh-remote-panel — client half.
  *
- * Registers one official Conversation View ("SSH 终端") through the
- * conversation.view slot: the app renders the tab, manages its lifecycle
- * (unmount on conversation switch, fresh remount on return), and the
- * component resolves the CURRENT session from standard session-scoped props
- * — no breadcrumb-title matching, no DOM injection, nothing runs until the
- * user opens the tab.
+ * STRICT per-conversation gating: the "SSH 终端" conversation view is
+ * registered ONLY while the currently viewed session actually has ssh-remote
+ * history. The view tab strip projects the slots ledger unconditionally
+ * (ViewTab = {id,label}, no visibility predicate), so gating is done by
+ * REGISTERING/UNREGISTERING the view entry dynamically:
  *
- * The view body hosts the standalone panel page
- * (/ssh-remote-panel/?session=<id>) in an iframe; a session without
- * ssh-remote history gets a light placeholder. When the session id cannot
- * be resolved the iframe falls back to the unscoped operator view (history
- * stays readable) and a one-shot diag line reports the props it actually
- * received, so field mismatches are visible in panel-debug.log. */
+ *   SshViewGate  — a null-rendering entry in the session-scoped
+ *                  conversation.session.header.utilities slot; it reads the
+ *                  current session id from standard props (sessionId /
+ *                  useSession), probes the backend once per session
+ *                  (journal existence = durable proof), and keeps the
+ *                  conversation.view entry registered exactly while that
+ *                  session qualifies. Unmounting on a conversation switch
+ *                  disposes the registration, so the tab follows the
+ *                  session automatically.
+ *
+ *   SshTerminalView — the view body: the standalone panel page in an iframe
+ *                  (?session=<id> pins the conversation's journal). It only
+ *                  renders after the gate confirmed the session. */
 window.__ModuleLoader__.load({
 	id: "dsh-plugin-ssh-remote-panel",
 	factory: (require) => {
@@ -22,6 +28,7 @@ window.__ModuleLoader__.load({
 		const React = require("react");
 
 		var probeCache = new Map();
+		var slotsRef = null;
 
 		function extractSessionId(props) {
 			if (props != null && typeof props.sessionId === "string" && props.sessionId !== "") return props.sessionId;
@@ -46,10 +53,11 @@ window.__ModuleLoader__.load({
 			} catch (_) {}
 		}
 
+		/** Journal existence for this exact session id = it ran ssh-remote. */
 		function probeSession(sessionId) {
 			var cached = probeCache.get(sessionId);
 			var now = Date.now();
-			if (cached !== undefined && now - cached.at < 15000) return Promise.resolve(cached.ok);
+			if (cached !== undefined && now - cached.at < 30000) return Promise.resolve(cached.ok);
 			return fetch("/ssh-remote-panel/sessions?agent=" + encodeURIComponent(sessionId), { cache: "no-store" })
 				.then(function (r) { return r.json() })
 				.then(function (data) {
@@ -60,72 +68,60 @@ window.__ModuleLoader__.load({
 				.catch(function () { return false });
 		}
 
+		/* ---------- the view body (renders only when the gate passed) ----- */
+
 		function SshTerminalView(props) {
 			var sessionId = extractSessionId(props);
-			var state = React.useState({ loading: sessionId !== "", ok: false });
-			var value = state[0];
-			var setValue = state[1];
-			React.useEffect(function () {
-				if (sessionId === "") {
-					setValue({ loading: false, ok: false, noId: true });
-					return undefined;
-				}
-				var alive = true;
-				setValue({ loading: true, ok: false });
-				probeSession(sessionId).then(function (ok) {
-					if (alive) setValue({ loading: false, ok: ok });
-				});
-				return function () { alive = false };
-			}, [sessionId]);
-			React.useEffect(function () {
-				// One-shot structural report: exact props/ids this build hands a
-				// conversation.view entry (written to panel-debug.log).
-				var keys = [];
-				try { keys = Object.keys(props || {}) } catch (_) {}
-				reportDiag("view", {
-					propsKeys: keys.join(","),
-					resolvedId: sessionId,
-					probe: value.loading ? "loading" : String(value.ok),
-				});
-			}, [sessionId]);
-			if (value.loading) {
-				return React.createElement("div", {
-					style: { padding: "32px", textAlign: "center", color: "var(--dsw-alias-label-secondary)", fontSize: "13px" },
-				}, "…");
-			}
-			if (!value.ok) {
-				if (value.noId === true) {
-					// Session id unresolvable in this build: show the full
-					// operator view instead of blocking the user.
-					return React.createElement("iframe", {
-						src: "/ssh-remote-panel/",
-						title: "SSH 终端",
-						style: { width: "100%", height: "100%", minHeight: "420px", border: "0", display: "block", borderRadius: "8px" },
-					});
-				}
-				return React.createElement("div", {
-					style: {
-						padding: "40px 24px", textAlign: "center",
-						color: "var(--dsw-alias-label-secondary)", fontSize: "13px", lineHeight: 1.8,
-					},
-				},
-					React.createElement("div", { style: { fontSize: "15px", color: "var(--dsw-alias-label-primary)", marginBottom: "6px" } }, "此会话没有 SSH 远程记录"),
-					React.createElement("div", null, "ssh-remote 预设的会话会在这里显示终端回放；历史会话可从左侧打开对应对话查看。"));
-			}
 			return React.createElement("iframe", {
-				src: "/ssh-remote-panel/?session=" + encodeURIComponent(sessionId),
+				src: sessionId !== ""
+					? "/ssh-remote-panel/?session=" + encodeURIComponent(sessionId)
+					: "/ssh-remote-panel/",
 				title: "SSH 终端",
 				style: { width: "100%", height: "100%", minHeight: "420px", border: "0", display: "block", borderRadius: "8px" },
 			});
 		}
 
+		/* ---------- the gate (drives the tab's existence) ------------------ */
+
+		function SshViewGate(props) {
+			var sessionId = extractSessionId(props);
+			var state = React.useState(false);
+			var hasSsh = state[0];
+			var setHasSsh = state[1];
+			React.useEffect(function () {
+				if (sessionId === "") {
+					setHasSsh(false);
+					return undefined;
+				}
+				var alive = true;
+				probeSession(sessionId).then(function (ok) {
+					if (alive) setHasSsh(ok);
+				});
+				return function () { alive = false };
+			}, [sessionId]);
+			React.useEffect(function () {
+				// Register the view exactly while the viewed session qualifies;
+				// the reactive slots ledger adds/removes the tab immediately.
+				if (!hasSsh || slotsRef === undefined) return undefined;
+				return slotsRef.register(
+					{ name: "conversation.view", id: "ssh-terminal", order: 20, label: "SSH 终端" },
+					function (vprops) { return React.createElement(SshTerminalView, vprops) },
+				);
+			}, [hasSsh]);
+			React.useEffect(function () {
+				reportDiag("gate", { sessionId: sessionId, hasSsh: String(hasSsh) });
+			}, [sessionId, hasSsh]);
+			return null;
+		}
+
 		function apply(ctx) {
 			var slots = ctx.get("slots");
 			if (slots === undefined) return;
-			slots.inject("conversation.view", function () {
+			slotsRef = slots;
+			slots.inject("conversation.session.header.utilities", function () {
 				return slots.register(
-					{ name: "conversation.view", id: "ssh-terminal", order: 20, label: "SSH 终端" },
-					function (props) { return React.createElement(SshTerminalView, props) },
+					{ name: "conversation.session.header.utilities", id: "ssh-view-gate", order: 999 },
+					function (props) { return React.createElement(SshViewGate, props) },
 				);
 			});
 		}
