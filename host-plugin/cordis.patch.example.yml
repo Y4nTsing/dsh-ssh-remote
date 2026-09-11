@@ -17,10 +17,14 @@
 - insert:
     - id: ssh-remote-panel
       name: dsh-plugin-ssh-remote-panel
+      # v3: official conversation.view client module + /sessions?agent= exact
+      # session gating; no more tapIndex page injection.
       # SSH-remote terminal panel, host-plane backend: serves the
-      # /ssh-remote-panel routes and injects panel.js/panel.css into the GUI
       # index. Lives on the host composition because DSH 0.1.5 no longer lets
       # preset rows reach the listening webServer; reads the preset plugin's
       # live state through globalThis.__dsrSshRemotePanel. Source of truth:
       # plugins/dsh-plugin-ssh-remote-panel (also copied into node_modules).
+      # NOTE: package.json exports points at lib/index-v2.js — bump that
+      # filename whenever lib/index.js changes without a host restart, so
+      # the ESM module cache sees a fresh URL on live remount.
 
