@@ -35,6 +35,14 @@
   var hadRows = false
   var storedOpen = null
   var currentIsSsh = false   /* backend: the viewed conversation runs ssh-remote */
+  /* 0.1.x GUI hardening: the app re-renders its own DOM; per-second
+   * injections and attribute writes on ITS nodes caused render wars that
+   * hung page load. Rate-limit session refreshes under mutation storms and
+   * circuit-break tab injection when the renderer keeps removing it. */
+  var lastRefreshAt = 0
+  var refreshTrailing = null
+  var tabCreations = []
+  var injectBanUntil = 0
 
   /* ---------- shared content (one instance, two possible hosts) ---------- */
   var content = document.createElement('div')
@@ -503,7 +511,7 @@
     return (document.title || '').trim().slice(0, 200)
   }
 
-  function refreshSessions() {
+  function refreshSessionsNow() {
     var hint = currentTitleHint()
     var qs = standalone ? 'all=1' : (hint !== '' ? 'titleHint=' + encodeURIComponent(hint) : '')
     var url = '/ssh-remote-panel/sessions' + (qs !== '' ? '?' + qs : '')
@@ -511,9 +519,16 @@
       .then(function (r) { return r.json() })
       .then(function (data) {
         var rows = Array.isArray(data) ? data : (data != null && Array.isArray(data.sessions) ? data.sessions : [])
+        var wasSsh = currentIsSsh
         currentIsSsh = data != null && data.currentIsSsh === true
         sessionRows = rows
         root.classList.toggle('available', sessionRows.length > 0)
+        if (!standalone) root.classList.toggle('embedded', findViewTablist() !== null)
+        // Preset transition drives the tab mount/unmount — event-driven, not
+        // on a timer, so a re-rendering app is never fought for the DOM.
+        if (currentIsSsh !== wasSsh) {
+          try { injectTab() } catch (_) {}
+        }
         if (sessionRows.length > 0 && !hadRows) {
           hadRows = true
           if (storedOpen === null) applyOpen(sessionRows.some(function (r) { return r.connected }))
@@ -536,6 +551,23 @@
           }
         }
       })
+  }
+
+  /** Rate-limited wrapper: mutation storms from the app's own re-renders
+   * must not translate into a request storm; trailing calls coalesce. */
+  function refreshSessions() {
+    var now = Date.now()
+    if (now - lastRefreshAt < 750) {
+      if (refreshTrailing === null) {
+        refreshTrailing = setTimeout(function () {
+          refreshTrailing = null
+          refreshSessionsNow().catch(function () {})
+        }, 800)
+      }
+      return Promise.resolve()
+    }
+    lastRefreshAt = now
+    return refreshSessionsNow()
   }
 
   function pollTerm() {
@@ -620,6 +652,9 @@
   function injectTab() {
     var tl = findViewTablist()
     if (tl === null) return
+    // Circuit breaker: if the app's renderer keeps removing our tab, stop
+    // fighting it for a while instead of feeding a render war.
+    if (Date.now() < injectBanUntil) return
     embed.tablist = tl
     if (!currentIsSsh) {
       // Not an ssh-remote conversation: the tab must not exist here.
@@ -627,6 +662,13 @@
       return
     }
     if (tl.querySelector('[data-dsr-tab]') === null) {
+      var now = Date.now()
+      tabCreations = tabCreations.filter(function (t) { return now - t < 30_000 })
+      tabCreations.push(now)
+      if (tabCreations.length > 8) {
+        injectBanUntil = now + 60_000
+        return
+      }
       var tabs = tl.querySelectorAll('[role="tab"]')
       var inactive = null
       var active = null
@@ -653,10 +695,13 @@
       })
       tl.appendChild(btn)
       embed.btn = btn
-      tl.addEventListener('click', function (e) {
-        var t = e.target && e.target.closest ? e.target.closest('[role="tab"]') : null
-        if (t !== null && !t.hasAttribute('data-dsr-tab') && embed.active) deactivateEmbed(false)
-      }, true)
+      if (tl.__dsrDelegated !== true) {
+        tl.__dsrDelegated = true
+        tl.addEventListener('click', function (e) {
+          var t = e.target && e.target.closest ? e.target.closest('[role="tab"]') : null
+          if (t !== null && !t.hasAttribute('data-dsr-tab') && embed.active) deactivateEmbed(false)
+        }, true)
+      }
     } else {
       embed.btn = tl.querySelector('[data-dsr-tab]')
     }
@@ -689,13 +734,19 @@
       && embed.host !== null && embed.host.isConnected
   }
 
+  /** Full teardown: leaving an ssh conversation (or the renderer replacing
+   * the layout) must leave NO residue — the embed container is detached and
+   * all anchors nulled so the next activation rebuilds against the CURRENT
+   * layout instead of reattaching stale references. */
   function unmountTab() {
     if (embed.active) deactivateEmbed(false)
     if (embed.btn !== null && embed.btn.parentElement !== null) embed.btn.remove()
     embed.btn = null
-    if (embed.container !== null && embed.container.parentElement !== null) {
-      embed.container.style.display = 'none'
-    }
+    if (embed.container !== null && embed.container.parentElement !== null) embed.container.remove()
+    embed.container = null
+    embed.host = null
+    embed.tablist = null
+    embed.headerWrapper = null
   }
 
   /** Size the embed container EXPLICITLY against the box-generating host:
@@ -757,17 +808,14 @@
         embed.hidden.push(child)
       }
     }
-    var tl = embed.tablist
-    if (tl !== null) {
-      tl.querySelectorAll('[role="tab"]').forEach(function (b) {
-        if (b.hasAttribute('data-dsr-tab')) {
-          b.setAttribute('aria-selected', 'true')
-          embed.activeTokens.forEach(function (t) { b.classList.add(t) })
-        } else {
-          b.setAttribute('aria-selected', 'false')
-          embed.activeTokens.forEach(function (t) { b.classList.remove(t) })
-        }
-      })
+    // Visual state on OUR button only. Writing aria-selected/class on the
+    // app's own tab buttons made its renderer detect foreign DOM writes and
+    // re-render, which our observer answered — an infinite loop that hung
+    // page load. The app's active-tab highlight stays as-is while the
+    // terminal is open; that cosmetic trade stops the war.
+    if (embed.btn !== null) {
+      embed.btn.setAttribute('aria-selected', 'true')
+      embed.activeTokens.forEach(function (t) { embed.btn.classList.add(t) })
     }
     refreshSessions().then(refreshJobs).then(function () {
       placeEmbed()
@@ -825,9 +873,13 @@
     root.classList.toggle('embedded', findViewTablist() !== null)
   }
 
+  /* Reassert ONLY while the terminal is open: keep the container sized and
+   * the conversation surface hidden. No timer-driven DOM work while closed —
+   * tab mounting is event-driven (currentIsSsh transitions via
+   * refreshSessions, breadcrumb changes via the observer). */
   setInterval(function () {
-    if (standalone) return
-    reassertEmbed()
+    if (standalone || !embed.active) return
+    try { reassertEmbed() } catch (_) {}
   }, 1000)
 
   /* Conversation switches must feel instant, not wait for the next poll:
@@ -854,11 +906,14 @@
       domDebounce = null
       if (document.visibilityState === 'hidden') return
       var hint = currentTitleHint()
-      if (hint !== lastHintSeen || embed.btn === null) {
+      if (hint !== lastHintSeen || (embed.btn === null && currentIsSsh)) {
         lastHintSeen = hint
-        refreshSessions().then(reassertEmbed).catch(function () {})
-      } else {
-        reassertEmbed()
+        // refreshSessions is rate-limited internally; the currentIsSsh
+        // transition hook inside it mounts/unmounts the tab.
+        refreshSessions().catch(function () {})
+      } else if (embed.active) {
+        // Open terminal: layout may have shifted under us.
+        try { reassertEmbed() } catch (_) {}
       }
     }, 150)
   })
