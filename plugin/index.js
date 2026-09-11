@@ -1264,6 +1264,17 @@ function panelIndexHtml() {
 /** Panel-visible managed-job metadata, keyed by harness job id. */
 const panelJobs = new Map()
 
+/** Host-plane panel bridge: DSH 0.1.5 no longer lets preset rows resolve the
+ * listening webServer (a preset-scoped ctx.get('webServer') returns an
+ * instance whose routes never reach the socket), so the panel backend moved
+ * to a host-composition plugin (profiles/web/plugins/dsh-plugin-ssh-remote-
+ * panel). It reads this plugin's live state — same process — through this
+ * shared object; module scope runs once per process, so the maps stay stable
+ * across mount generations. */
+try {
+  globalThis.__dsrSshRemotePanel = { transcripts, connections, panelJobs }
+} catch {}
+
 function trimPanelJobs() {
   if (panelJobs.size <= 150) return
   const settled = [...panelJobs.entries()]
@@ -2179,9 +2190,12 @@ function apply(ctx) {
     }
   })
 
-  // Right-side terminal replay panel inside the web GUI (see the panel
-  // section above). No-op in a headless deployment without the webServer.
-  registerPanel(ctx)
+  // The panel backend now lives on the HOST composition
+  // (dsh-plugin-ssh-remote-panel via the profile's cordis.patch.yml) because
+  // DSH 0.1.5 preset scopes no longer resolve the listening webServer; this
+  // plugin only publishes its live state through
+  // globalThis.__dsrSshRemotePanel (module scope). registerPanel above stays
+  // only as reference/source and is deliberately NOT called.
 
   // Plugin teardown: no SSH connection this plugin opened outlives it.
   ctx.effect(() => () => closeAllConnections(), `${PLUGIN_NAME}.closeAll`)

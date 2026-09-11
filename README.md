@@ -70,9 +70,16 @@
 │    ├─ ssh2（preset 本地 node_modules，--ignore-scripts 纯 JS）│
 │    ├─ 连接按 SessionId 键控，会话结束自动断开                  │
 │    ├─ journal 写入 <workspace>/.ssh-remote/                   │
-│    └─ 消费宿主 webServer 服务：                                │
-│        /ssh-remote-panel/* 路由（面板资产 + JSON API）          │
-│        tapIndex 注入面板脚本（同源、随宿主回环绑定）             │
+│    └─ 活状态（连接/journal/jobs）经 globalThis 发布给宿主插件   │
+└──────────────────────────────────────────────────────────────┘
+          │ 同进程 globalThis.__dsrSshRemotePanel
+          ▼
+┌─ host-plugin/（dsh-plugin-ssh-remote-panel，挂宿主组合）──────┐
+│  DSH ≥ 0.1.5：preset 作用域拿到的 webServer 不再是监听实例，    │
+│  面板后端搬到宿主组合（profile 的 cordis.patch.yml insert）：    │
+│    ├─ /ssh-remote-panel/* 路由（面板资产 + JSON API）           │
+│    ├─ tapIndex 注入面板脚本（同源、随宿主回环绑定）              │
+│    └─ 磁盘 journal + 宿主服务（sessionQuery/agents/jobs）       │
 │                                                              │
 │  plugin/panel.js/css ── 浏览器侧（无依赖 vanilla JS）          │
 │    ├─ 标签注入（ARIA 锚点 + 样式克隆 + 每秒重断言）             │
@@ -96,7 +103,16 @@ Copy-Item -Recurse dsh-ssh-remote "$HOME\.dsh\.agent-presets\ssh-remote"
 cd "$HOME\.dsh\.agent-presets\ssh-remote"
 npm install --omit=optional --ignore-scripts
 
-# 3. 重启 DSH 宿主进程，新建会话时选择 ssh-remote 预设
+# 3. 安装面板宿主插件（DSH ≥ 0.1.5 必需；旧版可跳过）
+#    （$profile 是你的 dsh web profile 目录，默认 ~/.dsh/profiles/web）
+Copy-Item -Recurse "$HOME\.dsh\.agent-presets\ssh-remote\host-plugin\dsh-plugin-ssh-remote-panel" "$profile\plugins\"
+New-Item -ItemType Directory -Force "$profile\node_modules\dsh-plugin-ssh-remote-panel\lib" | Out-Null
+Copy-Item "$profile\plugins\dsh-plugin-ssh-remote-panel\package.json" "$profile\node_modules\dsh-plugin-ssh-remote-panel\"
+Copy-Item "$profile\plugins\dsh-plugin-ssh-remote-panel\lib\index.js" "$profile\node_modules\dsh-plugin-ssh-remote-panel\lib\"
+#    然后把 host-plugin/cordis.patch.example.yml 里的 ssh-remote-panel
+#    insert 段落合并进 $profile\cordis.patch.yml
+
+# 4. 重启 DSH 宿主进程，新建会话时选择 ssh-remote 预设
 ```
 
 Linux / macOS 对应 `~/.dsh/.agent-presets/ssh-remote`。
@@ -123,7 +139,9 @@ Linux / macOS 对应 `~/.dsh/.agent-presets/ssh-remote`。
 
 ## 兼容性
 
-在 `@deepseek-ai/dsh@0.1.1-rc.2`（Windows 宿主）上开发与验证；面板与预设机制均为运行时探测式适配，DSH 升级后若失效，诊断日志会给出结构差异线索。
+- `@deepseek-ai/dsh@0.1.5-rc.2`（Windows 宿主）：**预设作用域不再解析监听中的 webServer**——preset 行里 `ctx.get('webServer')` 拿到的实例路由永远到不了端口（实测：注册成功日志 + 路由 404 并存）。面板后端因此搬进 `host-plugin/`（宿主组合插件，经 profile 的 `cordis.patch.yml` 挂载），preset 侧只通过 `globalThis.__dsrSshRemotePanel` 发布活状态。0.1.5 同时给 GUI 加了启动 token + 签名 cookie 认证（面板具名路由不受影响，与 GUI 同源同信任边界）
+- `@deepseek-ai/dsh@0.1.1-rc.2`：最初开发与验证版本，面板后端当时直接由 preset 行注册
+- 面板与预设机制均为运行时探测式适配，DSH 升级后若失效，`panel-debug.log` 会给出结构差异线索
 
 ## License
 

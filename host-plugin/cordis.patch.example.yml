@@ -1,0 +1,26 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- insert:
+    - id: mcap-align
+      name: mcap-align
+      # Model capability alignment settings page (browser UI via dsh.client;
+      # host entry is a no-op). Source of truth: plugins/mcap-align under this
+      # profile directory (edit there, copy to node_modules, restart).
+- insert:
+    - id: archived-sessions
+      name: dsh-plugin-archived-sessions
+      # Archived sessions manager: sidebar drawer + settings page with
+      # restore and permanent delete. Source of truth:
+      # plugins/dsh-plugin-archived-sessions (also copied into node_modules;
+      # registered as a file: dependency in package.json).
+- insert:
+    - id: ssh-remote-panel
+      name: dsh-plugin-ssh-remote-panel
+      # SSH-remote terminal panel, host-plane backend: serves the
+      # /ssh-remote-panel routes and injects panel.js/panel.css into the GUI
+      # index. Lives on the host composition because DSH 0.1.5 no longer lets
+      # preset rows reach the listening webServer; reads the preset plugin's
+      # live state through globalThis.__dsrSshRemotePanel. Source of truth:
+      # plugins/dsh-plugin-ssh-remote-panel (also copied into node_modules).
+

@@ -1,0 +1,17 @@
+{
+  "name": "dsh-plugin-ssh-remote-panel",
+  "version": "1.0.0",
+  "description": "SSH-remote terminal panel (host-plane bridge): serves /ssh-remote-panel routes + index injection from the host composition so the panel survives preset mount generations and the 0.1.5 preset service scoping.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "files": [
+    "lib/index.js"
+  ]
+}
