@@ -302,11 +302,37 @@ function sessionRunsSshRemote(ctx, sessionId) {
 
 /* ---------- session rows (disk + live merge) ------------------------------ */
 
-async function panelSessions(ctx, titleHint = '', scopeAll = false) {
+/** A session id in the shapes journal filenames and the roster produce. */
+function idVariants(sessionId) {
+  const clean = String(sessionId).replace(/[^a-zA-Z0-9-]/g, '')
+  return new Set([String(sessionId), clean, safeId(sessionId), sanitizeFullId(sessionId)])
+}
+
+/** Sessions rows scoped one of three ways, in priority order:
+ *  - agent=<sessionId>: EXACT session identity (the official conversation
+ *    view passes the current session id — no title matching, and gating is
+ *    simply "a journal exists for this session");
+ *  - titleHint: legacy breadcrumb-title resolution (standalone page);
+ *  - all=1: the operator view. */
+async function panelSessions(ctx, titleHint = '', scopeAll = false, agentParam = null) {
   const live = liveState()
-  const matched = await resolveCurrentSessionId(ctx, titleHint)
+  let matched = null
   let scopeWs = null
-  if (!scopeAll && matched !== null && typeof matched.cwd === 'string' && matched.cwd.length > 0) {
+  let exactIds = null
+  if (agentParam !== null && String(agentParam).length > 0) {
+    exactIds = idVariants(agentParam)
+    matched = { id: String(agentParam), cwd: null }
+    // Scope to the workspace of this session's own journal, when known.
+    for (const disk of await discoverDiskSessions(ctx)) {
+      if (exactIds.has(disk.agentId)) {
+        scopeWs = pathResolve(disk.workspace)
+        break
+      }
+    }
+  } else {
+    matched = await resolveCurrentSessionId(ctx, titleHint)
+  }
+  if (!scopeAll && scopeWs === null && matched !== null && typeof matched.cwd === 'string' && matched.cwd.length > 0) {
     scopeWs = pathResolve(matched.cwd)
   }
   const inScope = (ws) => scopeWs === null || (typeof ws === 'string' && pathResolve(ws) === scopeWs)
@@ -374,10 +400,9 @@ async function panelSessions(ctx, titleHint = '', scopeAll = false) {
   let currentId = matched !== null ? matched.id : null
   let currentIsSsh = currentId !== null && sessionRunsSshRemote(ctx, currentId)
   if (currentId !== null) {
-    const currentTag = safeId(currentId)
-    const currentFull = sanitizeFullId(currentId)
+    const variants = exactIds ?? idVariants(currentId)
     for (const row of capped) {
-      if (row.agentId === currentId || row.agentId === currentTag || row.agentId === currentFull) {
+      if (variants.has(row.agentId)) {
         // A journal file for this exact session id is durable proof the
         // session runs the ssh-remote preset: DSH 0.1.5 resumes agents
         // lazily, so a merely VIEWED historical session has no live
@@ -647,7 +672,13 @@ function makePanelHandler(ctx) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' })
         const hint = url.searchParams.get('titleHint') ?? ''
         const scopeAll = url.searchParams.get('all') === '1'
-        const { rows, currentIsSsh, scopeWorkspace } = await panelSessions(ctx, hint, scopeAll)
+        const agent = url.searchParams.get('agent')
+        const { rows, currentIsSsh, scopeWorkspace } = await panelSessions(
+          ctx,
+          hint,
+          scopeAll,
+          agent !== null && agent !== '' ? agent : null,
+        )
         return sendJson(res, 200, { sessions: rows, currentIsSsh, scopeWorkspace })
       }
       if (segment === 'transcript') {
@@ -720,16 +751,13 @@ function apply(ctx) {
       })
     },
   })
-  const disposeTap = web.tapIndex((html) => (html.includes(`${PANEL_BASE}/panel.js`)
-    ? html
-    : html.replace(
-      '</head>',
-      `<link rel="stylesheet" href="${PANEL_BASE}/panel.css">\n<script defer src="${PANEL_BASE}/panel.js"></script>\n</head>`,
-    )))
-  panelDebug(`host-plugin: routes + tap registered on webServer (port=${web.port}, host=${web.host})`)
+  // NO tapIndex: the frontend is now an official client module (lib/client.js
+  // registers the conversation.view "SSH 终端" tab through the slots system),
+  // so nothing is injected into every page load. This route only serves the
+  // JSON API, the panel assets, and the standalone page the view hosts.
+  panelDebug(`host-plugin: routes registered on webServer (port=${web.port}, host=${web.host}, no tap)`)
   ctx.effect(() => () => {
     disposeRoute()
-    disposeTap()
   }, 'ssh-remote-panel.routes')
 }
 

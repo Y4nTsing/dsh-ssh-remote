@@ -122,6 +122,17 @@
   root.querySelector('#dsr-grip').addEventListener('dblclick', function () { applyWidth(460) })
 
   var standalone = window.location.pathname.indexOf('/ssh-remote-panel') === 0
+  /* When hosted as the conversation view's iframe (?session=<id>), preselect
+   * and STAY on that conversation's journal: the dropdown can still switch
+   * for a quick look, but the default pick follows the embedding session. */
+  var presetSession = null
+  var presetApplied = false
+  if (standalone) {
+    try {
+      var q = new URLSearchParams(window.location.search).get('session')
+      if (q !== null && q !== '') presetSession = q
+    } catch (_) {}
+  }
   if (standalone) {
     var sp = root.querySelector('#dsr-panel')
     sp.style.width = '100%'; sp.style.borderLeft = 'none'; sp.style.position = 'static'
@@ -535,6 +546,19 @@
         }
         if (sessionRows.length === 0) hadRows = false
         renderSessionSelect()
+        // Embedded preselect: the conversation view's iframe pins its own
+        // session unless the user explicitly picked another from the dropdown.
+        if (presetSession !== null && !presetApplied) {
+          var preset = sessionRows.find(function (r) {
+            return r.agentId === presetSession || String(r.agentId).indexOf(presetSession.replace(/[^a-zA-Z0-9-]/g, '')) !== -1
+              || presetSession.indexOf(String(r.agentId)) !== -1
+          })
+          if (preset !== undefined) {
+            presetApplied = true
+            switchSession(preset, true)
+            return
+          }
+        }
         if (!manualChoice) {
           var pick = sessionRows.find(function (r) { return r.current })
             ?? sessionRows.find(function (r) { return r.connected })
