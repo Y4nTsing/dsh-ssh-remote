@@ -351,13 +351,17 @@ async function panelSessions(ctx, titleHint = '', scopeAll = false) {
   list.sort((a, b) => (Number(b.connected) - Number(a.connected)) || (b.lastWrite - a.lastWrite))
   const capped = list.slice(0, 40)
   let currentId = matched !== null ? matched.id : null
-  const currentIsSsh = currentId !== null && sessionRunsSshRemote(ctx, currentId)
-  if (currentId !== null && !currentIsSsh) currentId = null
+  let currentIsSsh = currentId !== null && sessionRunsSshRemote(ctx, currentId)
   if (currentId !== null) {
     const currentTag = safeId(currentId)
     const currentFull = sanitizeFullId(currentId)
     for (const row of capped) {
       if (row.agentId === currentId || row.agentId === currentTag || row.agentId === currentFull) {
+        // A journal file for this exact session id is durable proof the
+        // session runs the ssh-remote preset: DSH 0.1.5 resumes agents
+        // lazily, so a merely VIEWED historical session has no live
+        // composition binding to ask composedPreset about.
+        currentIsSsh = true
         row.current = true
         row.label = `${row.label} · 当前会话`
       }
