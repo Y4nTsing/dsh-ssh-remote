@@ -149,7 +149,14 @@ async function validJournalFile(file, { jobs = false } = {}, ctx = null) {
   return false
 }
 
-const DISCOVERY_TTL_MS = 1200
+/** Short-lived caches so the panel's conversation-switch polling stays
+ * cheap. The TITLE catalog is the expensive one (sessionQuery listSessions +
+ * readTitleSnapshots over every session — on 0.1.5 that fold is heavy and
+ * must NOT run per poll; with the panel polling every 1.2s it starved the
+ * whole app), so it lives much longer than the disk-discovery cache: titles
+ * change rarely, journals change often. */
+const TITLE_TTL_MS = 30_000
+const DISCOVERY_TTL_MS = 5_000
 const discoveryCache = new Map()
 
 async function discoverDiskSessions(ctx = null) {
@@ -219,34 +226,48 @@ async function discoverWorkspaceSessions(ws) {
 /* ---------- current-conversation resolution ------------------------------ */
 
 let titleCatalog = { expires: 0, entries: [] }
+/** One refresh at a time: concurrent polls share the in-flight catalog load
+ * instead of stacking listSessions+readTitleSnapshots calls. */
+let titleCatalogLoading = null
 
 async function sessionTitleCatalog(ctx) {
   if (titleCatalog.expires > Date.now()) return titleCatalog.entries
-  const query = ctx.get('sessionQuery')
-  if (query === undefined) return null
-  try {
-    const records = await query.listSessions()
-    if (!Array.isArray(records)) return null
-    const entries = []
-    for (const record of records) {
-      const id = record?.header?.id
-      if (typeof id !== 'string' || id.length === 0) continue
-      entries.push({ id, preset: record.header.agentPreset ?? '', live: record.live === true, cwd: record.header.cwd ?? null, title: '' })
+  if (titleCatalogLoading !== null) return titleCatalogLoading
+  titleCatalogLoading = (async () => {
+    const query = ctx.get('sessionQuery')
+    if (query === undefined) return null
+    try {
+      const records = await query.listSessions()
+      if (!Array.isArray(records)) return null
+      const entries = []
+      for (const record of records) {
+        const id = record?.header?.id
+        if (typeof id !== 'string' || id.length === 0) continue
+        entries.push({ id, preset: record.header.agentPreset ?? '', live: record.live === true, cwd: record.header.cwd ?? null, title: '' })
+      }
+      if (entries.length === 0) {
+        // Negative cache too: a failing/empty fold must not retry per poll.
+        titleCatalog = { expires: Date.now() + TITLE_TTL_MS, entries: [] }
+        return titleCatalog.entries
+      }
+      const observations = await query.readTitleSnapshots(entries.map((e) => e.id)).catch(() => [])
+      for (const obs of Array.isArray(observations) ? observations : []) {
+        if (obs?.status !== 'fulfilled') continue
+        const title = obs?.value?.title?.title
+        if (typeof title !== 'string') continue
+        const entry = entries.find((e) => e.id === obs.sessionId)
+        if (entry !== undefined) entry.title = title
+      }
+      titleCatalog = { expires: Date.now() + TITLE_TTL_MS, entries }
+      return entries
+    } catch {
+      titleCatalog = { expires: Date.now() + 5_000, entries: [] }
+      return titleCatalog.entries
+    } finally {
+      titleCatalogLoading = null
     }
-    if (entries.length === 0) return null
-    const observations = await query.readTitleSnapshots(entries.map((e) => e.id)).catch(() => [])
-    for (const obs of Array.isArray(observations) ? observations : []) {
-      if (obs?.status !== 'fulfilled') continue
-      const title = obs?.value?.title?.title
-      if (typeof title !== 'string') continue
-      const entry = entries.find((e) => e.id === obs.sessionId)
-      if (entry !== undefined) entry.title = title
-    }
-    titleCatalog = { expires: Date.now() + DISCOVERY_TTL_MS, entries }
-    return entries
-  } catch {
-    return null
-  }
+  })()
+  return titleCatalogLoading
 }
 
 async function resolveCurrentSessionId(ctx, hint) {
