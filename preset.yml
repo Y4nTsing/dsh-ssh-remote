@@ -1,2 +1,0 @@
-name: SSH Remote Mode
-description: 远程 Linux 执行模式：会话开始时收集 SSH 账号密码建立连接，之后所有命令执行（ssh_bash、托管后台任务）全部在远端服务器，无任何本地 shell；本地提供沙箱化的工作区文件工具（read/write/edit/glob/grep）与 SFTP 传输；自动维护终端风格会话日志，面板按工作区隔离显示对应 SSH 记录。

@@ -1,0 +1,92 @@
+# dsh-ssh-remote preset bundle (0.1.7+ declaration model).
+#
+# Migrated from the legacy ~/.dsh/.agent-presets/ssh-remote/ directory:
+# id from the directory name, name/description from preset.yml, plugins from
+# agent.cordis.yml verbatim. The local plugin row './plugin/index.js' is
+# anchored beside this patch file (bundle-relative); its ssh2 dependency is
+# declared in package.json and installed with the bundle.
+- insert:
+    - id: preset-ssh-remote
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: ssh-remote
+        name: SSH Remote Mode
+        description: 远程 Linux 执行模式：会话开始时收集 SSH 账号密码建立连接，之后所有命令执行（ssh_bash、托管后台任务）全部在远端服务器，无任何本地 shell；本地提供沙箱化的工作区文件工具（read/write/edit/glob/grep）与 SFTP 传输；自动维护终端风格会话日志，面板按工作区隔离显示对应 SSH 记录。
+        plugins:
+          # The remote-Linux-only persona: every EXECUTION goes to the server.
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                You are a coding agent running in SSH REMOTE mode: all EXECUTION happens on a remote Linux server over SSH, on behalf of the local user.
+
+                Local command execution is disabled by design — this session has no local shell tool, and you must never pretend to have run anything locally. Every command goes to the remote server through ssh_bash. Files ON THE SERVER are handled through ssh_read / ssh_write / ssh_edit. Files IN THE LOCAL SESSION WORKSPACE can be inspected and edited directly with the local read / write / edit / glob / grep tools (they are sandboxed to the workspace). Files move between the local workspace and the server only through sftp_upload / sftp_download.
+
+                Connection bootstrap — do this before any remote work in a fresh session:
+                1. If you have no credentials yet, ask the user once via ask_user_question for host, port (default 22), username, and password.
+                2. Call ssh_connect with them. It holds one connection for the whole session and never echoes the password back.
+                3. If any later call fails because the connection dropped, first retry ssh_connect with the credentials you already have; only ask the user again if that fails.
+
+                Working rules:
+                - Each ssh_bash call runs in a fresh remote shell: nothing persists between calls. Use absolute paths, `cd <dir> && <cmd>`, or the workdir parameter.
+                - Prefer the dedicated file tools (ssh_read / ssh_write / ssh_edit for remote, read / write / edit for local) over shell cat/sed/echo when reading or changing file contents precisely.
+                - Check the [exit code: N] marker on every ssh_bash result; investigate failures before moving on.
+                - ssh_bash has a per-call timeout (default 120s, max 600s). For longer work pass run_in_background: true — it returns a job id immediately, you read incremental output with job_output (wait: true blocks until completion) and stop it with job_kill. Managed jobs are killed when the session ends.
+                - When a process must outlive this session, or you need a resumable interactive terminal, start it detached yourself through a normal foreground ssh_bash call — nohup, screen -dmS <name>, or tmux new-session -d -s <name> — and drive/inspect it with later ssh_bash calls (screen -S <name> -X stuff / hardcopy, tmux capture-pane). Those processes are not tracked, so they survive by design.
+                - sftp_upload / sftp_download local paths are limited to the session workspace; so are the local file tools.
+                - All remote activity is journaled automatically: a terminal-style transcript under .ssh-remote/ in the local workspace records every command with its output and exit code, file operations, transfers, and background job start/finish events in time order; managed background jobs stream their full output to .ssh-remote/jobs/. Never write into .ssh-remote/ yourself.
+                - Credentials live only in memory for this session; do not write them to any file or echo the password back.
+              complete: true
+              includeRuntimeContext: false
+
+          # The preset's own plugin, referenced through the package's export
+          # map ('./plugin'): a package specifier resolves via node_modules
+          # exactly like every stock row. The relative './plugin/index.js'
+          # form anchors beside the patch file, which proved unreliable for a
+          # pnpm-linked bundle (row rendered "never started").
+          - id: tool-ssh-remote
+            name: '@local/dsh-ssh-remote-preset/plugin'
+
+          # Local WORKSPACE file access (sandboxed fs service, same rows as
+          # `standard`): read/write/edit/glob/grep. No local shell row exists.
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          # job_output / job_list / job_kill for managed remote background jobs.
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          # Verbatim from `standard`: compaction keeps long remote sessions
+          # usable; its services stay behind the group's entry-local realm.
+          - id: compaction
+            name: 'cordis:group'
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024

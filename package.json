@@ -1,10 +1,19 @@
 {
-  "name": "ssh-remote-preset",
+  "name": "@local/dsh-ssh-remote-preset",
+  "version": "1.0.1",
   "private": true,
-  "version": "1.0.0",
   "type": "module",
-  "description": "Local dependency root for the ssh-remote preset plugin (ssh2).",
+  "exports": {
+    ".": "./index.js",
+    "./plugin": "./plugin/index.js",
+    "./package.json": "./package.json"
+  },
   "dependencies": {
     "ssh2": "^1.17.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
