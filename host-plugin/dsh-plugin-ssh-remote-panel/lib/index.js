@@ -44,10 +44,11 @@ const TRANSCRIPT_JOBS_DIR = 'jobs'
 const DSH_HOME = process.env.DSH_HOME ?? pathResolve(homedir(), '.dsh')
 const WORKSPACE_REGISTRY = process.env.DSH_SSH_REMOTE_REGISTRY
   ?? pathResolve(DSH_HOME, 'ssh-remote-workspaces.json')
-/** The preset directory still owns panel.js / panel.css and the debug log —
- * single source of truth, editable without touching this plugin. */
-const PRESET_PLUGIN_DIR = process.env.DSH_SSH_REMOTE_PRESET_DIR
-  ?? pathResolve(DSH_HOME, '.agent-presets', 'ssh-remote', 'plugin')
+/** This package's own directory: panel.js / panel.css / panel-debug.log are
+ * served from here — self-contained since the 0.1.7 preset migration retired
+ * the legacy ~/.dsh/.agent-presets/ssh-remote directory. */
+const HERE = fileURLToPath(new URL('.', import.meta.url))
+const PRESET_PLUGIN_DIR = process.env.DSH_SSH_REMOTE_PRESET_DIR ?? HERE
 
 /* ---------- live state published by the preset plugin (same process) ----- */
 
