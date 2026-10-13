@@ -45,6 +45,15 @@ const EXEC_NO_RESPONSE_GRACE_MS = Number(process.env.DSH_SSH_EXEC_GRACE_MS) || 5
 /** How long a liveness probe (a no-op `true`) may take before the connection
  * is treated as dead and re-established. */
 const PROBE_TIMEOUT_MS = Number(process.env.DSH_SSH_PROBE_TIMEOUT_MS) || 10_000
+/**
+ * After a timeout kills a foreground command, how long it may still report its
+ * own result before the call is settled locally anyway (the session's
+ * connection is dropped at that point). Bounded because ssh2 emits `close` only
+ * when the PEER closes the channel, and OpenSSH keeps a session channel open for
+ * as long as the exec'd child runs — a wedged command must never decide when a
+ * tool call ends. Env-overridable for tests.
+ */
+const KILL_SETTLE_GRACE_MS = Number(process.env.DSH_SSH_KILL_SETTLE_GRACE_MS) || 5_000
 
 /** One session's SSH connection state; keyed by the calling agent's id. */
 const connections = new Map()
@@ -463,6 +472,10 @@ async function ensureAlive(agentId, signal) {
  * streams keep their tail under STREAM_CAP_CHARS with a truncated flag.
  */
 function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, signal } = {}) {
+  // A signal that aborted before this call started never fires 'abort' again;
+  // without this the call would wait for the peer's CHANNEL_CLOSE like the
+  // timeout/abort cases below.
+  if (signal?.aborted) return Promise.reject(new Error('aborted'))
   const conn = connections.get(agentId)
   if (conn === undefined) return Promise.reject(notConnectedError())
   return new Promise((resolve, reject) => {
@@ -499,13 +512,52 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
         return
       }
       let timer = null
+      let settleTimer = null
+      /** End the call without waiting for the peer: drop the session's
+       * connection so the abandoned channel cannot poison the next operation —
+       * the next call re-establishes from the stored credentials (the same
+       * recover-and-reconnect philosophy the SFTP timeouts use). */
+      const settleLocally = (byTimeout) => {
+        if (settled) return
+        settled = true
+        if (timer !== null) clearTimeout(timer)
+        clearTimeout(outer)
+        signal?.removeEventListener('abort', onAbort)
+        closeConnection(agentId)
+        if (byTimeout === true) {
+          resolve({
+            exitCode: null,
+            signal: null,
+            timedOut: true,
+            timeoutMs,
+            stdout,
+            stderr,
+            stdoutTruncated: outTruncated,
+            stderrTruncated: errTruncated,
+          })
+        } else {
+          reject(new Error('aborted'))
+        }
+      }
       const kill = (byTimeout) => {
         if (timedOut) return
         timedOut = byTimeout === true
+        // ssh2 `signal()` is a no-op against OpenSSH (its session channels have
+        // no handler for the SSH "signal" request) and `close()` only SENDS
+        // CHANNEL_CLOSE — it never emits a local `close`. So neither action can
+        // settle this call on its own against a peer that keeps the channel
+        // open while its child runs.
         try {
           stream.signal('KILL')
         } catch {}
-        stream.close()
+        try {
+          stream.close()
+        } catch {}
+        // An explicit interrupt frees the turn at once; a timeout keeps a short
+        // grace so a command that is already finishing can still report its
+        // real output and exit code.
+        if (byTimeout === true) settleTimer = setTimeout(() => settleLocally(true), KILL_SETTLE_GRACE_MS)
+        else settleLocally(false)
       }
       if (timeoutMs > 0) timer = setTimeout(() => kill(true), timeoutMs)
       const onAbort = () => kill(false)
@@ -514,6 +566,7 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
         if (settled) return
         settled = true
         if (timer !== null) clearTimeout(timer)
+        if (settleTimer !== null) clearTimeout(settleTimer)
         clearTimeout(outer)
         signal?.removeEventListener('abort', onAbort)
       }
