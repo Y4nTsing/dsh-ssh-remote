@@ -36,10 +36,18 @@ const { Client, Server, utils: { sftp: { STATUS_CODE } } } = ssh2
 
 const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../plugin/index.js')
 
+
 const CHUNK = 32 * 1024
 const SLOW_SIZE = 4 * 1024 * 1024
+const TRICKLE_CHUNKS = 45 // ~4.5s at RATE_MS, i.e. 3x the guard below
+const TRICKLE_SIZE = TRICKLE_CHUNKS * CHUNK
+const STALL_AFTER_CHUNKS = 3
 const RATE_MS = 100 // global trickle: one 32 KiB chunk / 100ms regardless of pipelining
-const SLOW_SECONDS = (SLOW_SIZE / CHUNK) * RATE_MS / 1000
+// The guard must comfortably exceed the time to the FIRST progress signal,
+// which is bounded by the pre-read window (concurrency x 32 KiB). 20 chunks
+// worth of the 100ms trickle, with the interrupt well inside that.
+const GUARD_MS = 2000 // DSH_SFTP_STALL_TIMEOUT_MS (new) / DSH_SFTP_TRANSFER_TIMEOUT_MS (old)
+const INTERRUPT_AFTER_MS = 800 // well before the guard, well into a ~13s transfer
 let LOCAL_DIR = join(tmpdir(), `dsh-sftp-interrupt-${process.pid}`)
 try {
   mkdirSync(LOCAL_DIR, { recursive: true })
@@ -61,7 +69,7 @@ const closeConnection = (agentId) => {
 /* ---------- pull the real implementation out of the plugin source ---------- */
 function functionSource(src, name) {
   const match = new RegExp(`(async\\s+)?function ${name}\\(`).exec(src)
-  if (match === null) throw new Error(`function ${name} not found`)
+  if (match === null) return '' // absent in the pre-fix source, which is fine
   const from = match.index // keeps a leading `async ` when present
   let paren = 0
   let i = src.indexOf('(', from)
@@ -79,13 +87,13 @@ function functionSource(src, name) {
 
 function loadSftpLayer(file) {
   const src = readFileSync(file, 'utf8')
-  const constNames = ['SFTP_OPEN_TIMEOUT_MS', 'SFTP_OP_TIMEOUT_MS', 'SFTP_TRANSFER_TIMEOUT_MS']
+  const constNames = ['SFTP_OPEN_TIMEOUT_MS', 'SFTP_OP_TIMEOUT_MS', 'SFTP_TRANSFER_TIMEOUT_MS', 'SFTP_STALL_TIMEOUT_MS', 'SFTP_TRANSFER_CONCURRENCY']
   const constValues = constNames.map((n) => {
     const m = new RegExp(`^const ${n} = (.+)$`, 'm').exec(src)
     return m === null ? 0 : eval(m[1]) // eslint-disable-line no-eval
   })
-  const names = ['notConnectedError', 'withTimeout', 'isConnectionFailure', 'openFreshSftp', 'sftpCall', 'sftpFastGet', 'sftpFastPut']
-  const fns = names.map((n) => functionSource(src, n)).join('\n')
+  const names = ['notConnectedError', 'withTimeout', 'isConnectionFailure', 'openFreshSftp', 'withStallTimeout', 'sftpCall', 'sftpFastGet', 'sftpFastPut']
+  const fns = names.map((n) => functionSource(src, n)).filter((t) => t !== '').join('\n')
   const factory = new Function(
     'connections', 'closeConnection', 'ensureAlive', 'remoteExec', 'posix', 'shQuote',
     ...constNames,
@@ -95,7 +103,10 @@ function loadSftpLayer(file) {
   return factory(
     connections,
     closeConnection,
-    async () => {}, // ensureAlive: the peer here never drops the connection
+    async (agentId) => {
+      // Like the real ensureAlive: re-establish from the stored credentials.
+      if (!connections.has(agentId)) await connect(port, agentId)
+    },
     async () => {}, // remoteExec (only used by sftpEnsureRemoteDir, not exercised)
     posix,
     (v) => `'${String(v).replace(/'/g, `'\\''`)}'`,
@@ -144,21 +155,25 @@ function startPeer() {
               handles.get(handle.readUInt32BE(0, true)).path = filename
               sftp.handle(reqid, handle)
             })
+            const sizeOf = (p) => (p === '/slow.bin' ? SLOW_SIZE : p === '/trickle.bin' ? TRICKLE_SIZE : p === '/stall.bin' ? SLOW_SIZE : 4096)
+            const trickles = (p) => p === '/slow.bin' || p === '/trickle.bin'
             const statReply = (reqid, handle) => {
               const state = handles.get(handle.readUInt32BE(0, true))
-              const size = state?.path === '/slow.bin' ? SLOW_SIZE : 4096
-              sftp.attrs(reqid, attrsFor(size))
+              sftp.attrs(reqid, attrsFor(sizeOf(state?.path)))
             }
             sftp.on('FSTAT', (reqid, handle) => statReply(reqid, handle))
             sftp.on('STAT', (reqid) => sftp.attrs(reqid, attrsFor(SLOW_SIZE)))
             sftp.on('LSTAT', (reqid) => sftp.attrs(reqid, attrsFor(SLOW_SIZE)))
             sftp.on('READ', (reqid, handle, offset, length) => {
               const state = handles.get(handle.readUInt32BE(0, true))
-              const size = state?.path === '/slow.bin' ? SLOW_SIZE : 4096
+              const path = state?.path
+              const size = sizeOf(path)
               if (offset >= size) return sftp.status(reqid, STATUS_CODE.EOF)
+              // A wedged link: answer the first chunks, then never reply again.
+              if (path === '/stall.bin' && offset >= STALL_AFTER_CHUNKS * CHUNK) return
               const n = Math.min(length, CHUNK, size - offset)
               const send = () => sftp.data(reqid, Buffer.alloc(n, 0x41))
-              if (state?.path === '/slow.bin') setTimeout(send, reserveSlot())
+              if (trickles(path)) setTimeout(send, reserveSlot())
               else send()
             })
             sftp.on('WRITE', (reqid) => setTimeout(() => sftp.status(reqid, STATUS_CODE.OK), reserveSlot()))
@@ -200,6 +215,12 @@ function bounded(thunk, ms) {
   })
 }
 
+// One knob, two implementations: the progress-driven stall guard reads the
+// first, the retired wall-clock transfer cap the second. Same 300ms value, so
+// the same scenario shows the difference.
+process.env.DSH_SFTP_STALL_TIMEOUT_MS = String(GUARD_MS)
+process.env.DSH_SFTP_TRANSFER_TIMEOUT_MS = String(GUARD_MS)
+
 const { sftpFastGet, sftpFastPut } = loadSftpLayer(PLUGIN)
 const { server, port } = await startPeer()
 const results = []
@@ -208,14 +229,14 @@ const results = []
 {
   await connect(port, 'get')
   const ctrl = new AbortController()
-  setTimeout(() => ctrl.abort(), 1500)
+  setTimeout(() => ctrl.abort(), INTERRUPT_AFTER_MS)
   const local = join(LOCAL_DIR, 'slow.bin')
   const r = await bounded(() => sftpFastGet('get', '/slow.bin', local, ctrl.signal), 12_000)
   results.push({
     name: 'sftp_download interrupt stops the transfer',
     ...r,
-    pass: r.outcome === 'rejected' && r.error === 'aborted' && r.ms <= 3000,
-    detail: 'rejects with aborted within ~1.5s (watchdog 12s = transfer would still be running)',
+    pass: r.outcome === 'rejected' && r.error === 'aborted' && r.ms <= 2500,
+    detail: `rejects with aborted right after the interrupt at ${INTERRUPT_AFTER_MS}ms (transfer itself needs ~13s)`,
   })
 }
 
@@ -225,13 +246,40 @@ const results = []
   const local = join(LOCAL_DIR, 'upload.bin')
   writeFileSync(local, Buffer.alloc(SLOW_SIZE, 0x42))
   const ctrl = new AbortController()
-  setTimeout(() => ctrl.abort(), 1500)
+  setTimeout(() => ctrl.abort(), INTERRUPT_AFTER_MS)
   const r = await bounded(() => sftpFastPut('put', local, '/upload.bin', ctrl.signal), 12_000)
   results.push({
     name: 'sftp_upload interrupt stops the transfer',
     ...r,
-    pass: r.outcome === 'rejected' && r.error === 'aborted' && r.ms <= 3000,
-    detail: 'rejects with aborted within ~1.5s',
+    pass: r.outcome === 'rejected' && r.error === 'aborted' && r.ms <= 2500,
+    detail: `rejects with aborted right after the interrupt at ${INTERRUPT_AFTER_MS}ms`,
+  })
+}
+
+/* D: slow but progressing — must NOT be killed (no wall-clock cap) */
+{
+  await connect(port, 'trickle')
+  const local = join(LOCAL_DIR, 'trickle.bin')
+  const r = await bounded(() => sftpFastGet('trickle', '/trickle.bin', local, undefined), 12_000)
+  const bytes = r.outcome === 'resolved' ? readFileSync(local).length : -1
+  results.push({
+    name: 'slow-but-progressing transfer is not killed',
+    ...r,
+    pass: r.outcome === 'resolved' && bytes === TRICKLE_SIZE && r.ms > GUARD_MS,
+    detail: `completes ${TRICKLE_SIZE} bytes over ~${(TRICKLE_CHUNKS * RATE_MS / 1000).toFixed(1)}s, i.e. OUTLIVES the ${GUARD_MS}ms guard budget because it keeps making progress`,
+  })
+}
+
+/* E: a wedged link must still fail, and say why */
+{
+  await connect(port, 'stall')
+  const local = join(LOCAL_DIR, 'stall.bin')
+  const r = await bounded(() => sftpFastGet('stall', '/stall.bin', local, undefined), 8000)
+  results.push({
+    name: 'wedged transfer still fails',
+    ...r,
+    pass: r.outcome === 'rejected' && /no progress|timed out after/.test(String(r.error)) && r.ms <= 8000,
+    detail: `fails on stalls (${GUARD_MS}ms budget), never hangs`,
   })
 }
 

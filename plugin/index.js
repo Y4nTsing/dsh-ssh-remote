@@ -612,7 +612,22 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
  * tests. */
 const SFTP_OPEN_TIMEOUT_MS = Number(process.env.DSH_SFTP_OPEN_TIMEOUT_MS) || 20_000
 const SFTP_OP_TIMEOUT_MS = Number(process.env.DSH_SFTP_OP_TIMEOUT_MS) || 60_000
-const SFTP_TRANSFER_TIMEOUT_MS = Number(process.env.DSH_SFTP_TRANSFER_TIMEOUT_MS) || 180_000
+/** A TRANSFER has no wall-clock cap: it fails only when no chunk makes progress
+ * for this long. ssh2 reports every acknowledged chunk through the `step`
+ * callback of fastPut/fastGet (both directions), so a slow-but-moving link is
+ * never killed while a wedged one still is. Env-overridable for tests. */
+const SFTP_STALL_TIMEOUT_MS = Number(process.env.DSH_SFTP_STALL_TIMEOUT_MS) || 60_000
+/** How many 32 KiB chunks one transfer keeps in flight. ssh2's default (64, a
+ * 2 MiB pre-read window) delays the FIRST progress signal by the time the whole
+ * window needs on the wire — on a slow link that alone can look like a stall and
+ * would false-fire the guard below. 16 chunks (512 KiB) keeps the first signal
+ * within ~512 KiB of transfer while still allowing ~5 MB/s at 100ms RTT; raise
+ * it on fast, high-latency links. Env-overridable. */
+const SFTP_TRANSFER_CONCURRENCY = Number(process.env.DSH_SFTP_TRANSFER_CONCURRENCY) || 16
+/** Harness-side budget for one transfer tool call (`ToolDefinition.timeoutMs`,
+ * enforced by dsh-tool-call-timeout-policy). Deliberately generous: duration is
+ * no longer capped by the plugin, so this is only the outer backstop. */
+const TRANSFER_TOOL_TIMEOUT_MS = Number(process.env.DSH_SFTP_TOOL_TIMEOUT_MS) || 3_600_000
 
 function withTimeout(promise, ms, label, signal) {
   return new Promise((resolve, reject) => {
@@ -634,10 +649,14 @@ function withTimeout(promise, ms, label, signal) {
       reject(new Error('aborted'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
-    timer = setTimeout(() => {
-      done()
-      reject(new Error(`${label} timed out after ${ms}ms — the SFTP channel or the SSH connection is probably dead. Retry after ssh_connect.`))
-    }, ms)
+    // ms <= 0: no wall-clock deadline — the caller guards progress itself
+    // (transfers use withStallTimeout below).
+    if (ms > 0) {
+      timer = setTimeout(() => {
+        done()
+        reject(new Error(`${label} timed out after ${ms}ms — the SFTP channel or the SSH connection is probably dead. Retry after ssh_connect.`))
+      }, ms)
+    }
     promise.then((value) => {
       done()
       resolve(value)
@@ -670,7 +689,13 @@ async function openFreshSftp(agentId, signal) {
   }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel', signal)
 }
 
-/** Run one SFTP operation on a fresh channel with a hard timeout and ONE
+/**
+ * The caller's cancellation is NOT a transport failure and is never retried:
+ * it settles the call at once, closes the channel the operation rides on (so a
+ * transfer in flight really stops instead of running to its hard timeout) and
+ * drops the connection, which the next call re-establishes on demand.
+ *
+ * Run one SFTP operation on a fresh channel with a hard timeout and ONE
  * automatic retry: if the operation (or the channel open) fails for a
  * connection-caused reason, tear the connection down, reconnect via
  * ensureAlive, and run the operation once more on a brand-new channel. This
@@ -749,16 +774,58 @@ async function sftpEnsureRemoteDir(agentId, remotePath, signal) {
   await remoteExec(agentId, `mkdir -p -- ${shQuote(parent)}`, { timeoutMs: 15_000, signal }).catch(() => {})
 }
 
+/** Race one transfer against a PROGRESS-driven guard: every acknowledged chunk
+ * (the `bump` handler handed to the operation) pushes the deadline back, so a
+ * transfer may run as long as it keeps moving while a stalled link still fails
+ * after `stallMs` without progress. */
+function withStallTimeout(operation, stallMs, label, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('aborted'))
+      return
+    }
+    let timer = null
+    let onAbort = null
+    const done = () => {
+      if (timer !== null) clearTimeout(timer)
+      if (onAbort !== null) signal?.removeEventListener('abort', onAbort)
+    }
+    const bump = () => {
+      if (timer !== null) clearTimeout(timer)
+      timer = setTimeout(() => {
+        done()
+        reject(new Error(`${label} made no progress for ${stallMs}ms — the SFTP channel or the SSH connection is probably dead. Retry after ssh_connect.`))
+      }, stallMs)
+    }
+    onAbort = () => {
+      done()
+      reject(new Error('aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    bump()
+    operation(bump).then((value) => {
+      done()
+      resolve(value)
+    }, (error) => {
+      done()
+      reject(error)
+    })
+  })
+}
+
+/** Transfers run under withStallTimeout, so sftpCall gets no wall-clock budget
+ * (0): the only thing that kills a transfer is a stall, an interrupt/abort, or
+ * the harness's own ToolDefinition.timeoutMs backstop. */
 function sftpFastPut(agentId, localPath, remotePath, signal) {
-  return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (error) => (error ? reject(error) : resolve()))
-  }), SFTP_TRANSFER_TIMEOUT_MS, signal)
+  return sftpCall(agentId, (sftp) => withStallTimeout((bump) => new Promise((resolve, reject) => {
+    sftp.fastPut(localPath, remotePath, { concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
+  }), SFTP_STALL_TIMEOUT_MS, 'SFTP upload', signal), 0, signal)
 }
 
 function sftpFastGet(agentId, remotePath, localPath, signal) {
-  return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
-    sftp.fastGet(remotePath, localPath, (error) => (error ? reject(error) : resolve()))
-  }), SFTP_TRANSFER_TIMEOUT_MS, signal)
+  return sftpCall(agentId, (sftp) => withStallTimeout((bump) => new Promise((resolve, reject) => {
+    sftp.fastGet(remotePath, localPath, { concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
+  }), SFTP_STALL_TIMEOUT_MS, 'SFTP download', signal), 0, signal)
 }
 
 /** Local-side guard: resolve within the session workspace and reject escapes. */
@@ -2179,7 +2246,7 @@ function apply(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: `Uploaded ${value.bytes} bytes: ${value.localPath} -> ${value.remotePath}` }],
     },
-    timeoutMs: 300_000,
+    timeoutMs: TRANSFER_TOOL_TIMEOUT_MS,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
@@ -2230,7 +2297,7 @@ function apply(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: `Downloaded ${value.bytes} bytes: ${value.remotePath} -> ${value.localPath}` }],
     },
-    timeoutMs: 300_000,
+    timeoutMs: TRANSFER_TOOL_TIMEOUT_MS,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
       const remotePath = String(args.remote_path)

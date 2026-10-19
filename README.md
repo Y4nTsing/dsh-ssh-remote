@@ -29,7 +29,8 @@
 - **每次操作独立 SFTP 通道**：通道不复用、操作完即关——一个卡死的通道永远不会污染下一次操作
 - **exec 兜底超时**：连 exec 回调都不触发（死连接的另一种表现）时，`timeoutMs + 5s` 内必抛错并拆连，杜绝无限挂起
 - **前台命令的结束不再由远端决定**：ssh2 只在**对端**发 CHANNEL_CLOSE 时才 emit `close`，而 OpenSSH 在 exec 子进程还活着时不会关闭该 session 通道（也不实现 SSH `signal` 请求）——过去一条卡住的远端命令会让 `ssh_bash` 自己的 `timeoutMs` 和用户的打断同时失效，整轮对话只能等远端命令自己结束。现在超时后最多再等 `DSH_SSH_KILL_SETTLE_GRACE_MS`（默认 `5000`）就本地结束该调用并断开该连接（下一次调用照常自动重连），用户打断则立即结束
-- **传输可被中断**：`ssh_read` / `ssh_write` / `ssh_edit` / `sftp_upload` / `sftp_download` 把调用方的取消信号一路传到 SFTP 层——用户打断时立刻结束该工具调用，并关掉这条 SFTP 通道、断开连接（下一次调用照常自动重连），不必再干等 60s / 180s 的硬超时；打断**不会**触发自愈重试（重试只用于连接性问题）。代价：被中断的上传会在远端留下一个部分写入的文件
+- **传输可被中断**：`ssh_read` / `ssh_write` / `ssh_edit` / `sftp_upload` / `sftp_download` 把调用方的取消信号一路传到 SFTP 层——用户打断时立刻结束该工具调用，并关掉这条 SFTP 通道、断开连接（下一次调用照常自动重连），不必再等操作自己的硬超时；打断**不会**触发自愈重试（重试只用于连接性问题）。代价：被中断的上传会在远端留下一个部分写入的文件
+- **传输没有时长上限，只有"没进度"上限**：`sftp_upload` / `sftp_download` 用 ssh2 每个 chunk 的进度回调（`step`）驱动一个空闲计时器——**只要还在传就一直传**，慢链路/大文件不会在固定 180s 被砍（那个绝对上限已删除）；连续 `DSH_SFTP_STALL_TIMEOUT_MS`（默认 `60000`）零进度才判定链路死。传输窗口默认 16 个 32KiB chunk（`DSH_SFTP_TRANSFER_CONCURRENCY`）而非 ssh2 的 64：窗口越大吞吐越高，但**首个进度信号的等待也越久**（2MiB 窗口在慢链路上足以被误判为停滞）。工具侧预算同步提到 1 小时（`DSH_SFTP_TOOL_TIMEOUT_MS`），由 harness 的 tool-call-timeout 策略兜底
 - **后台任务真正抗断开**：连接抖动**不会**终止托管任务（`setsid` 远程进程继续跑），轮询自动重连后继续读输出，正常完成任务
 - 重连是**逐个会话共享的**：同一时刻多个工具调用并发重连，只会发起一次握手
 - 每次重连成功在 journal 里记一行 `auto-reconnected to user@host:port after connection loss`；重连失败则给出明确报错并建议重跑 `ssh_connect`
