@@ -130,7 +130,7 @@ const POLL_MARKER = '\u001e'
  * the model starts itself through plain foreground ssh_bash calls (nohup,
  * screen, tmux) is not tracked and survives this session by design.
  */
-function startRemoteBackgroundJob(agentId, command, transcript = null, meta = null) {
+function startRemoteBackgroundJob(agentId, command, transcript = null, meta = null, handle = null) {
   const dir = `/tmp/.dsh-jobs/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const startedAt = new Date()
   const decoder = new TextDecoder()
@@ -187,6 +187,14 @@ function startRemoteBackgroundJob(agentId, command, transcript = null, meta = nu
   const journalDelta = (text) => {
     recent = (recent + text).slice(-TRANSCRIPT_JOB_TAIL_CHARS)
     if (meta !== null) meta.tail = recent
+    // Feed the harness output ring (JobHandle.append): this is what `job_output`
+    // reads, and its own retention/spill policy applies. The plugin's extra
+    // `readOutput()` is not part of the harness contract and nothing calls it.
+    if (handle !== null && text.length > 0) {
+      try {
+        handle.append(text)
+      } catch {}
+    }
     if (jobFile === null || jobFileCapped || text.length === 0) return
     let chunk = text
     if (jobFileBytes + chunk.length > TRANSCRIPT_JOB_FILE_CAP) {
@@ -1691,7 +1699,9 @@ function makePanelHandler(ctx) {
         if (meta.status !== 'running') return sendJson(res, 409, { error: `job already ${meta.status}` })
         const jobs = ctx.get('jobs')
         if (jobs === undefined) return sendJson(res, 503, { error: 'jobs service unavailable' })
-        const result = jobs.kill(meta.id, meta.agent, 'panel request')
+        // `caller` is a SESSION ID (JobRegistry.kill), not the Agent object:
+        // the registry checks it against the owner and rejects a foreign caller.
+        const result = jobs.kill(meta.id, meta.agentId, 'panel request')
         return sendJson(res, 200, { result })
       }
       if (segment === 'diag') {
@@ -1921,7 +1931,6 @@ function apply(ctx) {
         const meta = {
           id: null,
           agentId,
-          agent: exec.agent,
           label: command,
           startedAt: Date.now(),
           endedAt: null,
@@ -1934,8 +1943,13 @@ function apply(ctx) {
         const jobId = jobs.start({
           kind: 'ssh',
           label: command,
-          ...exec.agent !== undefined ? { owner: exec.agent } : {},
-          run: () => startRemoteBackgroundJob(agentId, fullCommand, transcriptForExec(exec), meta),
+          // Durable lifecycle identity, same shape the stock bash tool passes.
+          toolCall: { callId: exec.callId, rootCallId: exec.rootCallId },
+          // `owner` is a SESSION ID, not the Agent object: JobRegistry resolves
+          // it with agents.get(owner) and refuses a spec whose owner has no live
+          // agent — an Agent object stringifies to "[object Object]" there.
+          ...exec.agent !== undefined ? { owner: exec.agent.id } : {},
+          run: (handle) => startRemoteBackgroundJob(agentId, fullCommand, transcriptForExec(exec), meta, handle),
         })
         meta.id = jobId
         panelJobs.set(jobId, meta)

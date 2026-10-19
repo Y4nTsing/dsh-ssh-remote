@@ -42,6 +42,8 @@
 
 - 远端以 `setsid` 独立会话启动，SSH 通道断开不影响进程
 - 接入 harness jobs 体系：`job_output`（增量流式读取，多字节字节精确） / `job_list` / `job_kill`（杀整个进程组），完成时主动通知模型
+- 注册遵守 harness 契约：`owner` 用**会话 id**（`exec.agent.id`，不是 Agent 对象——注册表用 `agents.get(owner)` 找活着的 Agent，传对象会报 `session "[object Object]" has no live agent`），并带上 `toolCall: { callId, rootCallId }`；面板的 `job_kill` 同样以会话 id 作为 caller
+- 输出通过注册表下发的 `JobHandle.append`（`run(handle)`）进入 harness 输出环——`job_output` 读的就是它（插件自己的 `readOutput()` 不属于契约、无人调用），面板读数则继续走自己的 tail 与 job 日志
 - 会话结束自动终止托管任务；手动 `nohup` / `screen` / `tmux` 不受追踪、跨会话存活（两档生命周期有意区分）
 
 ### 会话日志（journal）
