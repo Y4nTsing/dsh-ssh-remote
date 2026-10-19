@@ -3,3 +3,4 @@ panel-debug.log
 *.log
 .ssh-remote/
 .gcm-read.cjs
+.tmp-sftp/

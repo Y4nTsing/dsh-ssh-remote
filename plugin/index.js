@@ -614,16 +614,35 @@ const SFTP_OPEN_TIMEOUT_MS = Number(process.env.DSH_SFTP_OPEN_TIMEOUT_MS) || 20_
 const SFTP_OP_TIMEOUT_MS = Number(process.env.DSH_SFTP_OP_TIMEOUT_MS) || 60_000
 const SFTP_TRANSFER_TIMEOUT_MS = Number(process.env.DSH_SFTP_TRANSFER_TIMEOUT_MS) || 180_000
 
-function withTimeout(promise, ms, label) {
+function withTimeout(promise, ms, label, signal) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let timer = null
+    let onAbort = null
+    const done = () => {
+      if (timer !== null) clearTimeout(timer)
+      if (onAbort !== null) signal?.removeEventListener('abort', onAbort)
+    }
+    // A caller cancellation ends the wait at once. The operation itself is torn
+    // down by sftpCall (fresh channel closed + connection dropped), so waiting
+    // for the peer to answer would only delay the turn.
+    if (signal?.aborted) {
+      reject(new Error('aborted'))
+      return
+    }
+    onAbort = () => {
+      done()
+      reject(new Error('aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    timer = setTimeout(() => {
+      done()
       reject(new Error(`${label} timed out after ${ms}ms — the SFTP channel or the SSH connection is probably dead. Retry after ssh_connect.`))
     }, ms)
     promise.then((value) => {
-      clearTimeout(timer)
+      done()
       resolve(value)
     }, (error) => {
-      clearTimeout(timer)
+      done()
       reject(error)
     })
   })
@@ -640,7 +659,7 @@ function isConnectionFailure(error) {
 /** Open a FRESH SFTP channel for one operation, then close it. No channel is
  * reused across operations (a wedged channel from a dead connection can no
  * longer poison the next call), and the open itself is hard-timeout-bounded. */
-async function openFreshSftp(agentId) {
+async function openFreshSftp(agentId, signal) {
   const conn = connections.get(agentId)
   if (conn === undefined) throw notConnectedError()
   return withTimeout(new Promise((resolve, reject) => {
@@ -648,7 +667,7 @@ async function openFreshSftp(agentId) {
       if (error) reject(error)
       else resolve(sftp)
     })
-  }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel')
+  }), SFTP_OPEN_TIMEOUT_MS, 'opening the SFTP channel', signal)
 }
 
 /** Run one SFTP operation on a fresh channel with a hard timeout and ONE
@@ -656,15 +675,25 @@ async function openFreshSftp(agentId) {
  * connection-caused reason, tear the connection down, reconnect via
  * ensureAlive, and run the operation once more on a brand-new channel. This
  * is what makes a silently dropped SSH connection invisible to the model —
- * the call succeeds on the retry instead of erroring after a 60s hang. */
-async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS) {
+ * the call succeeds on the retry instead of erroring after a 60s hang.
+ *
+ * The caller's cancellation is NOT a transport failure and is never retried:
+ * it settles the call at once, closes the channel the operation rides on (so a
+ * transfer in flight really stops instead of running to its hard timeout) and
+ * drops the connection, which the next call re-establishes on demand. */
+async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS, signal = undefined) {
+  if (signal?.aborted) throw new Error('aborted')
   let attempt = 0
   for (;;) {
     let sftp
     try {
-      sftp = await openFreshSftp(agentId)
-      return await withTimeout(operation(sftp), timeoutMs, 'SFTP operation')
+      sftp = await openFreshSftp(agentId, signal)
+      return await withTimeout(operation(sftp), timeoutMs, 'SFTP operation', signal)
     } catch (error) {
+      if (signal?.aborted === true || error?.message === 'aborted') {
+        closeConnection(agentId)
+        throw new Error('aborted')
+      }
       if (!isConnectionFailure(error) || attempt >= 1) throw error
       attempt += 1
       closeConnection(agentId)
@@ -679,13 +708,13 @@ async function sftpCall(agentId, operation, timeoutMs = SFTP_OP_TIMEOUT_MS) {
   }
 }
 
-function sftpStat(agentId, remotePath) {
+function sftpStat(agentId, remotePath, signal) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
-  }), 30_000)
+  }), 30_000, signal)
 }
 
-function sftpReadText(agentId, remotePath, maxBytes) {
+function sftpReadText(agentId, remotePath, maxBytes, signal) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     const chunks = []
     let total = 0
@@ -702,34 +731,34 @@ function sftpReadText(agentId, remotePath, maxBytes) {
     })
     stream.on('error', reject)
     stream.on('end', () => resolve({ text: chunks.join(''), truncated }))
-  }), SFTP_OP_TIMEOUT_MS)
+  }), SFTP_OP_TIMEOUT_MS, signal)
 }
 
-function sftpWriteText(agentId, remotePath, content) {
+function sftpWriteText(agentId, remotePath, content, signal) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     const stream = sftp.createWriteStream(remotePath, { encoding: 'utf8' })
     stream.on('error', reject)
     stream.on('close', () => resolve())
     stream.end(content)
-  }), SFTP_OP_TIMEOUT_MS)
+  }), SFTP_OP_TIMEOUT_MS, signal)
 }
 
-async function sftpEnsureRemoteDir(agentId, remotePath) {
+async function sftpEnsureRemoteDir(agentId, remotePath, signal) {
   const parent = posix.dirname(remotePath)
   if (parent === '' || parent === '.' || parent === remotePath) return
-  await remoteExec(agentId, `mkdir -p -- ${shQuote(parent)}`, { timeoutMs: 15_000 }).catch(() => {})
+  await remoteExec(agentId, `mkdir -p -- ${shQuote(parent)}`, { timeoutMs: 15_000, signal }).catch(() => {})
 }
 
-function sftpFastPut(agentId, localPath, remotePath) {
+function sftpFastPut(agentId, localPath, remotePath, signal) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.fastPut(localPath, remotePath, (error) => (error ? reject(error) : resolve()))
-  }), SFTP_TRANSFER_TIMEOUT_MS)
+  }), SFTP_TRANSFER_TIMEOUT_MS, signal)
 }
 
-function sftpFastGet(agentId, remotePath, localPath) {
+function sftpFastGet(agentId, remotePath, localPath, signal) {
   return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
     sftp.fastGet(remotePath, localPath, (error) => (error ? reject(error) : resolve()))
-  }), SFTP_TRANSFER_TIMEOUT_MS)
+  }), SFTP_TRANSFER_TIMEOUT_MS, signal)
 }
 
 /** Local-side guard: resolve within the session workspace and reject escapes. */
@@ -1961,13 +1990,13 @@ function apply(ctx) {
       const path = String(args.path)
       const offset = parsePositiveInt(args.offset, 1)
       const limit = parsePositiveInt(args.limit, DEFAULT_READ_LIMIT)
-      const stats = await sftpStat(agentId, path).catch((error) => {
+      const stats = await sftpStat(agentId, path, exec.signal).catch((error) => {
         throw new Error(`cannot read remote file ${path}: ${error.message}`)
       })
       if (stats.size > MAX_READ_BYTES) {
         throw new Error(`remote file ${path} is ${stats.size} bytes (above the ${MAX_READ_BYTES} byte limit); read it in windows via ssh_bash (e.g. sed -n) instead`)
       }
-      const { text } = await sftpReadText(agentId, path, MAX_READ_BYTES).catch((error) => {
+      const { text } = await sftpReadText(agentId, path, MAX_READ_BYTES, exec.signal).catch((error) => {
         throw new Error(`cannot read remote file ${path}: ${error.message}`)
       })
       const allLines = text.length === 0 ? [] : text.split('\n')
@@ -2036,9 +2065,9 @@ function apply(ctx) {
       await ensureAlive(agentId, exec.signal)
       const path = String(args.path)
       const content = String(args.content)
-      await sftpEnsureRemoteDir(agentId, path)
+      await sftpEnsureRemoteDir(agentId, path, exec.signal)
       try {
-        await sftpWriteText(agentId, path, content)
+        await sftpWriteText(agentId, path, content, exec.signal)
       } catch (error) {
         throw new Error(`cannot write remote file ${path}: ${error.message}`)
       }
@@ -2089,11 +2118,11 @@ function apply(ctx) {
       const oldString = String(args.old_string)
       const newString = String(args.new_string)
       if (oldString.length === 0) throw new Error('invalid old_string: expected a non-empty string')
-      const stats = await sftpStat(agentId, path).catch((error) => {
+      const stats = await sftpStat(agentId, path, exec.signal).catch((error) => {
         throw new Error(`cannot read remote file ${path}: ${error.message}`)
       })
       if (stats.size > MAX_READ_BYTES) throw new Error(`remote file ${path} is too large to edit (${stats.size} bytes; limit ${MAX_READ_BYTES})`)
-      const { text } = await sftpReadText(agentId, path, MAX_READ_BYTES).catch((error) => {
+      const { text } = await sftpReadText(agentId, path, MAX_READ_BYTES, exec.signal).catch((error) => {
         throw new Error(`cannot read remote file ${path}: ${error.message}`)
       })
       const count = text.split(oldString).length - 1
@@ -2102,9 +2131,9 @@ function apply(ctx) {
         throw new Error(`old_string appears ${count} times in ${path}. Make it unique (add surrounding context) or pass replace_all: true.`)
       }
       const next = args.replace_all === true ? text.split(oldString).join(newString) : text.replace(oldString, newString)
-      await sftpEnsureRemoteDir(agentId, path)
+      await sftpEnsureRemoteDir(agentId, path, exec.signal)
       try {
-        await sftpWriteText(agentId, path, next)
+        await sftpWriteText(agentId, path, next, exec.signal)
       } catch (error) {
         throw new Error(`cannot write remote file ${path}: ${error.message}`)
       }
@@ -2159,9 +2188,9 @@ function apply(ctx) {
       const stats = await fsStat(localPath).catch(() => {
         throw new Error(`local file not found: ${localPath}`)
       })
-      await sftpEnsureRemoteDir(agentId, remotePath)
+      await sftpEnsureRemoteDir(agentId, remotePath, exec.signal)
       try {
-        await sftpFastPut(agentId, localPath, remotePath)
+        await sftpFastPut(agentId, localPath, remotePath, exec.signal)
       } catch (error) {
         throw new Error(`SFTP upload failed (${localPath} -> ${remotePath}): ${error.message}`)
       }
@@ -2207,11 +2236,11 @@ function apply(ctx) {
       const remotePath = String(args.remote_path)
       const localPath = resolveLocalWithinWorkspace(exec, String(args.local_path))
       await ensureAlive(agentId, exec.signal)
-      const stats = await sftpStat(agentId, remotePath).catch((error) => {
+      const stats = await sftpStat(agentId, remotePath, exec.signal).catch((error) => {
         throw new Error(`cannot stat remote file ${remotePath}: ${error.message}`)
       })
       try {
-        await sftpFastGet(agentId, remotePath, localPath)
+        await sftpFastGet(agentId, remotePath, localPath, exec.signal)
       } catch (error) {
         throw new Error(`SFTP download failed (${remotePath} -> ${localPath}): ${error.message}`)
       }
