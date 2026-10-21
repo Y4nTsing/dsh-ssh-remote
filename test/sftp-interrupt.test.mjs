@@ -13,7 +13,7 @@
  * sftpFastGet / sftpFastPut extracted from plugin/index.js.
  *
  *   node test/sftp-interrupt.test.mjs
- *   DSH_SSH_REMOTE_PLUGIN=/path/to/plugin/index.js node test/sftp-interrupt.test.mjs
+ *   DSH_SSH_REMOTE_PLUGIN=/path/to/preset/plugin/index.js node test/sftp-interrupt.test.mjs
  */
 import { createRequire } from 'node:module'
 import { generateKeyPairSync } from 'node:crypto'
@@ -34,7 +34,7 @@ try {
 }
 const { Client, Server, utils: { sftp: { STATUS_CODE } } } = ssh2
 
-const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../plugin/index.js')
+const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../preset/plugin/index.js')
 
 
 const CHUNK = 32 * 1024

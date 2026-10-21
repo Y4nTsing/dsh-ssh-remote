@@ -15,7 +15,7 @@
  * remoteExec, extracted from the plugin source — nothing is hand-copied.
  *
  *   node test/foreground-exec-settle.test.mjs
- *   DSH_SSH_REMOTE_PLUGIN=/path/to/plugin/index.js node test/foreground-exec-settle.test.mjs
+ *   DSH_SSH_REMOTE_PLUGIN=/path/to/preset/plugin/index.js node test/foreground-exec-settle.test.mjs
  */
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
@@ -37,7 +37,7 @@ try {
 }
 const { Client, Server } = ssh2
 
-const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../plugin/index.js')
+const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../preset/plugin/index.js')
 const GRACE_MS = Number(process.env.DSH_SSH_KILL_SETTLE_GRACE_MS) || 5_000
 const REMOTE_CMD_MS = 20_000 // the remote command outlives every deadline below
 

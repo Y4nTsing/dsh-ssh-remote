@@ -1,11 +1,14 @@
 {
-  "name": "@local/dsh-ssh-remote-preset",
-  "version": "1.0.1",
+  "name": "dsh-ssh-remote",
+  "version": "1.2.0",
   "private": true,
+  "description": "SSH Remote Mode for DeepSeek Harness: remote-Linux-only agent preset plus the host-side terminal panel (/ssh-remote-panel routes and the conversation.view client module).",
   "type": "module",
+  "main": "lib/index.js",
   "exports": {
-    ".": "./index.js",
-    "./plugin": "./plugin/index.js",
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./preset/plugin": "./preset/plugin/index.js",
     "./package.json": "./package.json"
   },
   "dependencies": {
@@ -14,6 +17,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   }
 }

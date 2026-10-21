@@ -65,32 +65,30 @@
 
 ## 工作原理
 
+`package.json` 的 `dsh.bundle.patch` 让 profile 把**这一个包**当作 bundle 组合；包里同时住着三个角色：
+
 ```
-┌─ preset（cordis.patch.yml + plugin/）──────────────────────────┐
+┌─ 包根 dsh-ssh-remote ─────────────────────────────────────────┐
+│  lib/index.js       宿主半边：/ssh-remote-panel/* 路由         │
+│                     （panel.js/css 资产 + JSON API + /diag）   │
+│  lib/client.js      客户端模块（dsh.client + exports./client） │
+│                     → conversation.view 的「SSH 终端」标签     │
+│  lib/panel.js/css   浏览器侧面板（无依赖 vanilla JS）          │
+│  cordis.patch.yml   两行 insert：面板行 + preset 行            │
+└───────────────────────────────────────────────────────────────┘
+          ▲ 同进程 globalThis.__dsrSshRemotePanel（活状态）
+          │ 磁盘 .ssh-remote/（journal、jobs 输出）
+┌─ preset/plugin/index.js（包内子导出 ./preset/plugin）─────────┐
 │  组合：persona + 7 个 ssh/sftp 工具 + ask-user + todo + jobs  │
-│         + 压缩组；不挂任何本地 shell/文件/搜索工具行            │
-│                                                              │
-│  plugin/index.js  ── 纯 JS，零 harness 内部依赖               │
-│    ├─ ssh2（preset 本地 node_modules，--ignore-scripts 纯 JS）│
+│         + 压缩组；不挂任何本地 shell/文件/搜索工具行           │
+│    ├─ ssh2（本包 dependencies，纯 JS）                        │
 │    ├─ 连接按 SessionId 键控，会话结束自动断开                  │
 │    ├─ journal 写入 <workspace>/.ssh-remote/                   │
-│    └─ 活状态（连接/journal/jobs）经 globalThis 发布给宿主插件   │
-└──────────────────────────────────────────────────────────────┘
-          │ 同进程 globalThis.__dsrSshRemotePanel
-          ▼
-┌─ host-plugin/（dsh-plugin-ssh-remote-panel，挂宿主组合）──────┐
-│  DSH ≥ 0.1.5：preset 作用域拿到的 webServer 不再是监听实例，    │
-│  面板后端搬到宿主组合（profile 的 cordis.patch.yml insert）：    │
-│    ├─ /ssh-remote-panel/* 路由（面板资产 + JSON API）           │
-│    ├─ tapIndex 注入面板脚本（同源、随宿主回环绑定）              │
-│    └─ 磁盘 journal + 宿主服务（sessionQuery/agents/jobs）       │
-│                                                              │
-│  lib/panel.js/css ── 浏览器侧（无依赖 vanilla JS）             │
-│    ├─ 标签注入（ARIA 锚点 + 样式克隆 + 每秒重断言）             │
-│    ├─ DOM MutationObserver 即时响应会话切换                    │
-│    └─ 每 12s 上报 DOM 结构诊断到 panel-debug.log               │
-└──────────────────────────────────────────────────────────────┘
+│    └─ 托管后台任务注册进 harness jobs（owner = 会话 id）       │
+└───────────────────────────────────────────────────────────────┘
 ```
+
+面板行在 bundle patch 里写的是**精确包名** `dsh-ssh-remote`：客户端模块扫描按精确 specifier 建表（`exactPackageSpecifier`），子路径行能挂上路由但**永远不出标签**；preset 的插件行走 `./preset/plugin` 子导出，和官方 plugin row 一样经 node_modules 解析。
 
 「当前会话」判定链：GUI 面包屑标题 → 宿主 `sessionQuery` 标题解析 → sessionId → `agents` + `agentPresets.composedPreset()` 运行时组合确认。不使用会话头部的 `agentPreset` 持久字段（创建时盖默认值，与实际所选预设无关）。
 
@@ -98,32 +96,35 @@
 
 前置：已运行的 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（`dsh web` 或其他入口）、pnpm、Node ≥ 18。
 
-DSH `0.1.7` 起预设改用 **bundle 模型**：本仓库自身就是一个可安装的预设 bundle（`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`），profile 按 `dsh.profile.bundles` 组合它，和普通插件 bundle 一样。旧的 `~/.dsh/.agent-presets/<名字>/` 目录模型已被上游废除，**不再被读取**。
+DSH `0.1.7` 起预设改用 **bundle 模型**：本仓库自身就是一个可安装的 bundle（`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`），profile 按 `dsh.profile.bundles` 组合它。**包根同时是宿主面板**，所以一条命令就装完了面板与预设两边——不再需要手工拷贝文件，也不需要改 profile 的 `cordis.patch.yml`。
 
-```powershell
-# 1. 克隆到任意目录（下文 $repo 指代克隆出来的目录）
-git clone https://github.com/Y4nTsing/dsh-ssh-remote.git
-$repo = "$PWD\dsh-ssh-remote"
+```bash
+# 一条命令：写进 profile 的 dependencies，并把本包加进 dsh.profile.bundles
+dsh plugin --profile web add "github:Y4nTsing/dsh-ssh-remote"
 
-# 2. 在 bundle 目录内装它自己的依赖（唯一依赖 ssh2；纯 JS 安装，跳过可选原生构建）
-Push-Location $repo; pnpm install --ignore-scripts; Pop-Location
-
-# 3. 把 bundle 装进 profile（$profile 默认 ~/.dsh/profiles/web）
-#    该命令会写 $profile\package.json 的 dependencies，并把本 bundle 加进 dsh.profile.bundles
-dsh plugin --profile web add "@local/dsh-ssh-remote-preset@link:$repo"
-
-# 4. 安装面板宿主插件（宿主半边：/ssh-remote-panel 路由 + 客户端标签，与 preset 分开）
-Copy-Item -Recurse "$repo\host-plugin\dsh-plugin-ssh-remote-panel" "$profile\plugins\"
-Copy-Item -Recurse "$repo\host-plugin\dsh-plugin-ssh-remote-panel" "$profile\node_modules\"
-#    再把 host-plugin\cordis.patch.example.yml 里的 ssh-remote-panel insert 段落
-#    合并进 $profile\cordis.patch.yml
-
-# 5. 重启 DSH 宿主进程，新建会话时选择 SSH Remote Mode
+# 重启 dsh 宿主进程（Node ESM 按 URL 缓存 .js，代码不能热换）
+# 之后新建会话时预设选 SSH Remote Mode
 ```
 
-Linux / macOS 只需把第 3 步原样照抄（`link:` 路径改成你的克隆路径）。
+Linux / macOS / Windows 同一条命令；`dsh plugin` 会把不是它自己的参数整体交给 pnpm，所以仓库是本地的也可以：
 
-> 面板插件是自包含的：`panel.js` / `panel.css` 从它自己的 `lib/` 目录读取，不依赖任何其他目录。
+```bash
+dsh plugin --profile web add "link:/path/to/dsh-ssh-remote"
+```
+
+**从旧布局升级**（`@local/dsh-ssh-remote-preset` + 手工拷贝的 `dsh-plugin-ssh-remote-panel`）：
+
+```bash
+dsh plugin --profile web remove @local/dsh-ssh-remote-preset
+dsh plugin --profile web add "github:Y4nTsing/dsh-ssh-remote"
+
+# 清掉旧的手工副本，以及 profile patch 里那段 ssh-remote-panel insert
+rm -rf ~/.dsh/profiles/web/plugins/dsh-plugin-ssh-remote-panel
+rm -rf ~/.dsh/profiles/web/node_modules/dsh-plugin-ssh-remote-panel
+# 重启 dsh
+```
+
+> 面板资产（`panel.js` / `panel.css`）从本包自己的 `lib/` 读取，随包安装，不再有"拷到哪儿"的问题。
 
 ## 使用
 
@@ -143,10 +144,11 @@ Linux / macOS 只需把第 3 步原样照抄（`link:` 路径改成你的克隆�
 
 - **插件代码变更需要重启宿主进程**：Node ESM 模块缓存按 URL 缓存（composition / 配置变更可热换代，`.js` 不行）。`panel.js` / `panel.css` 按请求从磁盘读取，刷新浏览器即生效
 - **GUI 标签注入与前端 DOM 结构耦合**（无官方扩展点）：用 ARIA 锚点 + 重断言尽量稳，前端大改版时自动回退浮动右栏
-- 面板诊断日志 `lib/panel-debug.log`（面板插件自身目录）持续追加（含会话标题等），可随时删除
+- 面板诊断日志 `lib/panel-debug.log`（本包 `lib/` 内）持续追加（含会话标题等），可随时删除
 
 ## 兼容性
 
+- `2.x`（2026-10-21）：**包根改为宿主面板 + 客户端模块**，agent preset 的插件移到包内 `./preset/plugin` 子导出，两行 insert 都写进本包的 `cordis.patch.yml`——一条 `dsh plugin add` 装完两边，撤销了 `host-plugin/` 目录与"手工拷贝 + 合并 profile patch"的安装步骤。升级需重装（见「安装」里的旧布局迁移）
 - `@deepseek-ai/dsh@0.1.7-rc.2`：**预设改为 bundle 模型**——`~/.dsh/.agent-presets/` 目录不再被读取，预设和普通插件 bundle 一样经 `package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml` 组合（见「安装」）。面板宿主插件同步改为**自包含**：`panel.js` / `panel.css` / `panel-debug.log` 都在它自己的 `lib/` 目录，不再回退到旧的 `.agent-presets` 路径
 - `@deepseek-ai/dsh@0.1.5-rc.2`（Windows 宿主）：**预设作用域不再解析监听中的 webServer**——preset 行里 `ctx.get('webServer')` 拿到的实例路由永远到不了端口（实测：注册成功日志 + 路由 404 并存）。面板后端因此搬进 `host-plugin/`（宿主组合插件，经 profile 的 `cordis.patch.yml` 挂载），preset 侧只通过 `globalThis.__dsrSshRemotePanel` 发布活状态。0.1.5 同时给 GUI 加了启动 token + 签名 cookie 认证（面板具名路由不受影响，与 GUI 同源同信任边界）
 - `@deepseek-ai/dsh@0.1.1-rc.2`：最初开发与验证版本，面板后端当时直接由 preset 行注册

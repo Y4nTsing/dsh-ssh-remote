@@ -1,10 +1,19 @@
-# dsh-ssh-remote preset bundle (0.1.7+ declaration model).
+# dsh-ssh-remote bundle (2.x layout).
 #
-# Migrated from the legacy ~/.dsh/.agent-presets/ssh-remote/ directory:
-# id from the directory name, name/description from preset.yml, plugins from
-# agent.cordis.yml verbatim. The local plugin row './plugin/index.js' is
-# anchored beside this patch file (bundle-relative); its ssh2 dependency is
-# declared in package.json and installed with the bundle.
+# The package ROOT is the host-side panel plugin (`lib/index.js`) plus its
+# client module (`lib/client.js`, declared through `dsh.client`); the agent
+# preset's own plugin rides along as the `./preset/plugin` sub-export. Installing
+# this one package therefore installs both planes, and no manual copy or profile
+# patch step is needed.
+#
+# Row 1 mounts the panel on the HOST composition. Its name is the EXACT package
+# name on purpose: the client-module scanner keys packages by exact specifier
+# (`exactPackageSpecifier`), so a subpath row would mount the routes but never
+# the "SSH 终端" tab.
+- insert:
+    - id: ssh-remote-panel
+      name: 'dsh-ssh-remote'
+
 - insert:
     - id: preset-ssh-remote
       name: '@deepseek-ai/dsh-agent-preset'
@@ -39,13 +48,12 @@
               complete: true
               includeRuntimeContext: false
 
-          # The preset's own plugin, referenced through the package's export
-          # map ('./plugin'): a package specifier resolves via node_modules
-          # exactly like every stock row. The relative './plugin/index.js'
-          # form anchors beside the patch file, which proved unreliable for a
-          # pnpm-linked bundle (row rendered "never started").
+          # The preset's own tools, reached through this package's export map
+          # ('./preset/plugin'). A package specifier resolves via node_modules
+          # exactly like every stock row; its ssh2 dependency is declared in
+          # this package's package.json.
           - id: tool-ssh-remote
-            name: '@local/dsh-ssh-remote-preset/plugin'
+            name: 'dsh-ssh-remote/preset/plugin'
 
           # Local WORKSPACE file access (sandboxed fs service, same rows as
           # `standard`): read/write/edit/glob/grep. No local shell row exists.

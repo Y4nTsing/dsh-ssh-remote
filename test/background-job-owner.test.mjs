@@ -17,16 +17,19 @@
  * above and the fixed code registers normally.
  *
  *   node test/background-job-owner.test.mjs
- *   DSH_SSH_REMOTE_PLUGIN=/path/to/plugin/index.js node test/background-job-owner.test.mjs
+ *   DSH_SSH_REMOTE_PLUGIN=/path/to/preset/plugin/index.js node test/background-job-owner.test.mjs
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve as pathResolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../plugin/index.js')
+const PLUGIN = process.env.DSH_SSH_REMOTE_PLUGIN ?? pathResolve(here, '../preset/plugin/index.js')
 const source = readFileSync(PLUGIN, 'utf8')
+/** The host panel half carries the same job-kill route and had the same bug. */
+const HOST = pathResolve(here, '../lib/index.js')
+const hostSource = existsSync(HOST) ? readFileSync(HOST, 'utf8') : ''
 
 /* ---------- extract the real tool definition ---------- */
 function extractToolDefinition(src, toolName) {
@@ -180,16 +183,21 @@ const results = []
   })
 }
 
-/* C: the panel's job-kill route must pass a SessionId caller too. Source-shape
- * check: the route needs the whole panel handler (fs, HTTP, session queries) to
- * run, which is out of scope here — the argument shape is what regressed. */
+/* C: EVERY job-kill route in the package must pass a SessionId caller. The
+ * preset's dead panel copy is gone; the host panel is the one that actually
+ * serves POST /job-kill, and it regressed to passing the Agent object before. */
 {
-  const good = /jobs\.kill\(meta\.id, meta\.agentId, 'panel request'\)/.test(source)
-  const bad = /jobs\.kill\(meta\.id, meta\.agent,/.test(source)
+  const sites = []
+  for (const [label, text] of [['preset', source], ['host panel', hostSource]]) {
+    for (const m of text.matchAll(/jobs\.kill\(([^)]*)\)/g)) sites.push({ label, args: m[1].trim() })
+  }
+  const bad = sites.filter((site) => !site.args.startsWith('meta.id, meta.agentId,'))
   results.push({
-    name: 'panel job-kill passes a session-id caller',
-    pass: good && !bad,
-    detail: good && !bad ? 'jobs.kill(meta.id, meta.agentId, …)' : `source check failed (good=${good}, bad=${bad})`,
+    name: 'every job-kill route passes a session-id caller',
+    pass: sites.length > 0 && bad.length === 0,
+    detail: sites.length === 0
+      ? 'no jobs.kill call site found'
+      : `${sites.length} site(s): ${sites.map((s) => `${s.label}(${s.args})`).join(', ')}`,
   })
 }
 
