@@ -476,13 +476,24 @@ async function ensureAlive(agentId, signal) {
  * Run one command on the session's connection. Fresh shell per call; output
  * streams keep their tail under STREAM_CAP_CHARS with a truncated flag.
  */
-function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, signal } = {}) {
+function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, signal, settleOnExitMarker = false } = {}) {
   // A signal that aborted before this call started never fires 'abort' again;
   // without this the call would wait for the peer's CHANNEL_CLOSE like the
   // timeout/abort cases below.
   if (signal?.aborted) return Promise.reject(new Error('aborted'))
   const conn = connections.get(agentId)
   if (conn === undefined) return Promise.reject(notConnectedError())
+  // settleOnExitMarker appends a sentinel printf to the command: OpenSSH keeps
+  // a session channel open while any child of the shell still lives (for
+  // example a setsid nohup job left running in the background), so waiting for
+  // CHANNEL_CLOSE would block the call until its timeout even though the
+  // foreground part already finished. The marker lets the call settle as soon
+  // as the shell is done; the channel is then left open so the detached child
+  // keeps running.
+  const exitMarker = settleOnExitMarker ? '__DSH_SSH_EXIT__' : null
+  const wireCommand = exitMarker === null
+    ? command
+    : command + "\nprintf '\\n" + exitMarker + "%s\\n' \"$?\""
   return new Promise((resolve, reject) => {
     let stdout = ''
     let stderr = ''
@@ -508,7 +519,7 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
           : '; run ssh_connect again.'),
       ))
     }, timeoutMs + EXEC_NO_RESPONSE_GRACE_MS)
-    conn.client.exec(command, (err, stream) => {
+    conn.client.exec(wireCommand, (err, stream) => {
       if (settled) return
       started = true
       if (err) {
@@ -575,12 +586,44 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
         clearTimeout(outer)
         signal?.removeEventListener('abort', onAbort)
       }
+      let markerExitCode = null
+      const settleFromMarker = () => {
+        if (settled) return
+        settled = true
+        finish()
+        if (signal?.aborted) return reject(new Error('aborted'))
+        resolve({
+          exitCode: markerExitCode,
+          signal: null,
+          timedOut: false,
+          timeoutMs,
+          stdout,
+          stderr,
+          stdoutTruncated: outTruncated,
+          stderrTruncated: errTruncated,
+        })
+      }
       stream.stdout.setEncoding('utf8')
       stream.stderr.setEncoding('utf8')
       stream.stdout.on('data', (chunk) => {
         outLen += chunk.length
         if (outLen > STREAM_CAP_CHARS) outTruncated = true
         stdout = (stdout + chunk).slice(-STREAM_CAP_CHARS)
+        if (exitMarker !== null && settled === false) {
+          const at = stdout.lastIndexOf(exitMarker)
+          if (at !== -1) {
+            const rest = stdout.slice(at + exitMarker.length)
+            const eol = rest.indexOf('\n')
+            if (eol !== -1) {
+              const raw = rest.slice(0, eol).trim()
+              if (/^-?\d+$/.test(raw)) {
+                markerExitCode = Number(raw)
+                stdout = stdout.slice(0, at).replace(/\r?\n$/, '') + rest.slice(eol + 1)
+                settleFromMarker()
+              }
+            }
+          }
+        }
       })
       stream.stderr.on('data', (chunk) => {
         errLen += chunk.length
@@ -588,10 +631,12 @@ function remoteExec(agentId, command, { timeoutMs = DEFAULT_EXEC_TIMEOUT_MS, sig
         stderr = (stderr + chunk).slice(-STREAM_CAP_CHARS)
       })
       stream.on('error', (error) => {
+        if (settled) return
         finish()
         reject(error)
       })
       stream.on('close', (exitCode, signalName) => {
+        if (settled) return
         finish()
         if (signal?.aborted) return reject(new Error('aborted'))
         resolve({
@@ -1027,11 +1072,11 @@ function capTranscriptStream(text) {
   return `${text.slice(-TRANSCRIPT_STREAM_CAP)}\n[transcript keeps the last ${TRANSCRIPT_STREAM_CAP} chars of a ${text.length}-char stream]\n`
 }
 
-/** Terminal-style foreground command entry (command + rendered result). */
-function transcriptCommandEntry({ hostLabel, workdir, command, value, error }) {
-  const head = `[${localStamp()}] ${hostLabel}${workdir !== undefined ? ` ${workdir}` : ''}\n$ ${command}\n`
-  if (error !== undefined) return `${head}[error] ${error.message === 'aborted' ? '[aborted]' : error.message}\n`
-  return `${head}${capTranscriptStream(renderExecResult(value))}\n`
+/** Head line of a foreground command, written BEFORE the call settles so the
+ * SSH terminal panel shows a running command instead of staying empty until
+ * the remote command finishes. */
+function transcriptCommandStart({ hostLabel, workdir, command }) {
+  return '[' + localStamp() + '] ' + hostLabel + (workdir !== undefined ? ' ' + workdir : '') + '\n$ ' + command + '\n'
 }
 
 /** One terse comment line for file operations and transfers. */
@@ -1264,17 +1309,20 @@ function apply(ctx) {
       })()
       const workdir = args.workdir !== undefined && args.workdir !== null ? String(args.workdir) : undefined
       const state = transcriptForExec(exec)
+      if (state !== null) {
+        writeTranscript(state, transcriptCommandStart({ hostLabel, workdir, command }))
+      }
       let value
       try {
-        value = await remoteExec(agentId, fullCommand, { timeoutMs, signal: exec.signal })
+        value = await remoteExec(agentId, fullCommand, { timeoutMs, signal: exec.signal, settleOnExitMarker: true })
       } catch (error) {
         if (state !== null) {
-          writeTranscript(state, transcriptCommandEntry({ hostLabel, workdir, command, error }))
+          writeTranscript(state, '[error] ' + (error.message === 'aborted' ? '[aborted]' : error.message) + '\n')
         }
         throw error
       }
       if (state !== null) {
-        writeTranscript(state, transcriptCommandEntry({ hostLabel, workdir, command, value }))
+        writeTranscript(state, capTranscriptStream(renderExecResult(value)) + '\n')
       }
       return value
     },
@@ -1362,7 +1410,7 @@ function apply(ctx) {
       },
       presentationMeta: (_args, value) => ({ path: value.path, offset: value.offset, lines: value.lines, totalLines: value.totalLines }),
     },
-    timeoutMs: 120_000,
+    timeoutMs: 300_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
       await ensureAlive(agentId, exec.signal)
@@ -1438,7 +1486,7 @@ function apply(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: `Wrote ${value.bytes} bytes to ${value.path}` }],
     },
-    timeoutMs: 120_000,
+    timeoutMs: 300_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
       await ensureAlive(agentId, exec.signal)
@@ -1489,7 +1537,7 @@ function apply(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: `Applied ${value.replacements} replacement(s) in ${value.path}` }],
     },
-    timeoutMs: 120_000,
+    timeoutMs: 300_000,
     async execute(args, exec) {
       const agentId = requireAgentId(exec)
       await ensureAlive(agentId, exec.signal)
