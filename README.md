@@ -43,6 +43,8 @@
 ### 托管后台任务（`run_in_background`）
 
 - 远端以 `setsid` 独立会话启动，SSH 通道断开不影响进程
+- 轮询用**短等待**：`job_output` 不带 `wait`，或 `wait: true` + `timeout_ms <= 30000`，完成时模型会收到主动通知；分钟级长等待会冻结整轮对话，看起来就是「卡住」
+- **不要把托管任务接在 `tail` / `head` 后面**：它们会缓冲到进程结束才输出，`job_output` 在整个任务期间都读不到增量（典型反例 `python3 poc.py ... 2>&1 | tail -30`）；需要限流就用 `python3 -u` / `stdbuf -oL`，输出留到任务结束后再裁剪
 - 接入 harness jobs 体系：`job_output`（增量流式读取，多字节字节精确） / `job_list` / `job_kill`（杀整个进程组），完成时主动通知模型
 - 注册遵守 harness 契约：`owner` 用**会话 id**（`exec.agent.id`，不是 Agent 对象——注册表用 `agents.get(owner)` 找活着的 Agent，传对象会报 `session "[object Object]" has no live agent`），并带上 `toolCall: { callId, rootCallId }`；面板的 `job_kill` 同样以会话 id 作为 caller
 - 输出通过注册表下发的 `JobHandle.append`（`run(handle)`）进入 harness 输出环——`job_output` 读的就是它（插件自己的 `readOutput()` 不属于契约、无人调用），面板读数则继续走自己的 tail 与 job 日志
