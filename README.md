@@ -19,6 +19,13 @@
 
 **本地（仅文件、无执行）**：`read` / `write` / `edit` / `glob` / `grep` —— 复用 DSH 官方沙箱化 fs 工具（`dsh-tool-fs` + `dsh-tool-fs-search`），限定在会话工作区内。会话需要看到本地工作区里有什么、就地编辑本地文件，但**组合里没有任何本地 shell 行**——本地命令执行在结构上不存在。
 
+### 与标准模式的能力对齐
+
+除了**本地 shell**（`bash` / `pwsh`）在结构上不存在，preset 组合与 `standard` 对齐：`agent-instructions`（AGENTS.md）、`time-context`、`tool-web`（`web_search` / `web_fetch`）、`skill-filesystem` + `tool-skill`、`command-goal` / `tool-goal`、`planning` + `plan-mode`、`tool-schedule`、`present`，以及 `delegation`（`subagent` / `subagent_fork` / `workflow`）。
+
+- **子代理锁定在本 preset**：`tool-subagent` 配 `agentPreset: ssh-remote` + `allowedAgentPresets: [ssh-remote]`，模型没有别的预设可选；`subagent_fork` 按构造继承父会话组合；`workflow` 的 `agent()` 同样继承父 preset
+- 每个子代理是**独立会话**，要自己 `ssh_connect`：`subagent_fork` 能看到父会话历史（含凭据），`subagent`（spawn）需要在任务提示里带上 host / 用户名 / 密码
+
 ### 连接稳定性（自动重连 + 每次操作独立 SFTP）
 
 云服务器（NAT / sshd 空闲策略）会静默断开几分钟未活动的 SSH 连接，导致工具调用报「无连接」或「SFTP operation timed out」。本模式内置**透明自动重连**和**每操作全新通道**，断开对模型不可见：
@@ -84,8 +91,12 @@
           ▲ 同进程 globalThis.__dsrSshRemotePanel（活状态）
           │ 磁盘 .ssh-remote/（journal、jobs 输出）
 ┌─ preset/plugin/index.js（包内子导出 ./preset/plugin）─────────┐
-│  组合：persona + 7 个 ssh/sftp 工具 + ask-user + todo + jobs  │
-│         + 压缩组；不挂任何本地 shell/文件/搜索工具行           │
+│  preset composition (bundle cordis.patch.yml):                │
+│    persona · agent-instructions · time-context                │
+│    · ssh tools · fs/fs-search · jobs · todo                   │
+│    · ask-user · schedule · skills · goal                      │
+│    · plan · delegation(ssh-remote) · web                      │
+│    · present · compaction — no local shell row                │
 │    ├─ ssh2（本包 dependencies，纯 JS）                        │
 │    ├─ 连接按 SessionId 键控，会话结束自动断开                  │
 │    ├─ journal 写入 <workspace>/.ssh-remote/                   │
