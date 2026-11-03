@@ -39,11 +39,13 @@
 - **前台命令的结束不再由远端决定**：ssh2 只在**对端**发 CHANNEL_CLOSE 时才 emit `close`，而 OpenSSH 在 exec 子进程还活着时不会关闭该 session 通道（也不实现 SSH `signal` 请求）——过去一条卡住的远端命令会让 `ssh_bash` 自己的 `timeoutMs` 和用户的打断同时失效，整轮对话只能等远端命令自己结束。现在超时后最多再等 `DSH_SSH_KILL_SETTLE_GRACE_MS`（默认 `5000`）就本地结束该调用并断开该连接（下一次调用照常自动重连），用户打断则立即结束
 - **前台命令正常结束也不再等通道关闭**：后台子进程（`setsid nohup … &`）还活着时 OpenSSH 同样不发 CHANNEL_CLOSE，过去这类命令会把 `ssh_bash` 拖到自己的超时——实测 `sleep 30` 的命令跑满 120.6s、`sleep 110` 的跑满 180.6s，而前台部分 30–110s 就结束了。现在命令尾部追加一个 `__DSH_SSH_EXIT__` 哨兵，shell 打印它即结算并保留通道，后台进程照常存活；`exec`、语法错误等打印不出哨兵的命令回退到上面的 close/超时路径
 - **传输可被中断**：`ssh_read` / `ssh_write` / `ssh_edit` / `sftp_upload` / `sftp_download` 把调用方的取消信号一路传到 SFTP 层——用户打断时立刻结束该工具调用，并关掉这条 SFTP 通道、断开连接（下一次调用照常自动重连），不必再等操作自己的硬超时；打断**不会**触发自愈重试（重试只用于连接性问题）。代价：被中断的上传会在远端留下一个部分写入的文件
-- **传输没有时长上限，只有"没进度"上限**：`sftp_upload` / `sftp_download` 用 ssh2 每个 chunk 的进度回调（`step`）驱动一个空闲计时器——**只要还在传就一直传**，慢链路/大文件不会在固定 180s 被砍（那个绝对上限已删除）；连续 `DSH_SFTP_STALL_TIMEOUT_MS`（默认 `60000`）零进度才判定链路死。传输窗口默认 16 个 32KiB chunk（`DSH_SFTP_TRANSFER_CONCURRENCY`）而非 ssh2 的 64：窗口越大吞吐越高，但**首个进度信号的等待也越久**（2MiB 窗口在慢链路上足以被误判为停滞）。工具侧预算同步提到 1 小时（`DSH_SFTP_TOOL_TIMEOUT_MS`），由 harness 的 tool-call-timeout 策略兜底
+- **整文件写入不再一次发完**：`ssh_write` / `ssh_edit` 过去用 ssh2 的 `createWriteStream()`——它把整个内容作为**一个** `SSH_FXP_WRITE` 发出并等这一个回包，于是只要有一个数据包被路径吞掉，调用就挂到自己的超时为止；实测某主机上 `open`/`fchmod`/`chmod` 全部 128ms 正常返回，而 2KiB 的 WRITE 永远没有响应，连接随即判死。现在改为 **16KiB 分块**、每块独立 8s 上限、失败就拆连重连并**按已确认偏移续写**（用 `r+` 而非 `w`，不覆盖已经落盘的前缀），最多 `DSH_SFTP_WRITE_ATTEMPTS`（默认 6）次；同一主机上 64KiB / 256KiB 一次成功约 1.2–2.2s
+- **写不进去时说清楚原因**：所有尝试都失败时，报错会明确指出「控制类请求正常、写数据无响应」属于**链路/代理（VPN、TUN、MTU 黑洞）问题**，而不是权限问题；如果已有部分字节落盘，也会报告进度，方便直接重试
+- **传输没有时长上限，只有"没进度"上限**：`sftp_upload` / `sftp_download` 用 ssh2 每个 chunk 的进度回调（`step`）驱动一个空闲计时器——**只要还在传就一直传**，慢链路/大文件不会在固定 180s 被砍（那个绝对上限已删除）；连续 `DSH_SFTP_STALL_TIMEOUT_MS`（默认 `60000`）零进度才判定链路死。传输窗口默认 4 个 **16KiB** chunk（`DSH_SFTP_TRANSFER_CONCURRENCY` / `DSH_SFTP_CHUNK_SIZE`）：窗口越大单包越大，被丢掉的概率和等待首个进度信号的时长都随之上升（实测 32KiB×16 的默认组合在该链路上直接超时，16KiB×4 约 0.8s 完成）。工具侧预算同步提到 1 小时（`DSH_SFTP_TOOL_TIMEOUT_MS`），由 harness 的 tool-call-timeout 策略兜底
 - **后台任务真正抗断开**：连接抖动**不会**终止托管任务（`setsid` 远程进程继续跑），轮询自动重连后继续读输出，正常完成任务
 - 重连是**逐个会话共享的**：同一时刻多个工具调用并发重连，只会发起一次握手
 - 每次重连成功在 journal 里记一行 `auto-reconnected to user@host:port after connection loss`；重连失败则给出明确报错并建议重跑 `ssh_connect`
-- 可调参数（环境变量覆盖，进程启动时读取）：`DSH_SSH_KEEPALIVE_INTERVAL_MS`（默认 `15000`）、`DSH_SSH_KEEPALIVE_COUNT_MAX`（默认 `6`）、`DSH_SSH_PROBE_TIMEOUT_MS`（默认 `10000`）、`DSH_SSH_EXEC_GRACE_MS`（默认 `5000`）、`DSH_SSH_KILL_SETTLE_GRACE_MS`（默认 `5000`）
+- 可调参数（环境变量覆盖，进程启动时读取）：`DSH_SSH_KEEPALIVE_INTERVAL_MS`（默认 `15000`）、`DSH_SSH_KEEPALIVE_COUNT_MAX`（默认 `6`）、`DSH_SSH_PROBE_TIMEOUT_MS`（默认 `10000`）、`DSH_SSH_EXEC_GRACE_MS`（默认 `5000`）、`DSH_SSH_KILL_SETTLE_GRACE_MS`（默认 `5000`）、`DSH_SFTP_CHUNK_SIZE`（默认 `16384`）、`DSH_SFTP_TRANSFER_CONCURRENCY`（默认 `4`）、`DSH_SFTP_STALL_TIMEOUT_MS`（默认 `60000`）、`DSH_SFTP_WRITE_CHUNK_BYTES`（默认同 `DSH_SFTP_CHUNK_SIZE`）、`DSH_SFTP_WRITE_CHUNK_TIMEOUT_MS`（默认 `8000`）、`DSH_SFTP_WRITE_ATTEMPTS`（默认 `6`）、`DSH_SFTP_CLOSE_TIMEOUT_MS`（默认 `5000`）
 
 > 若自动重连仍失败（比如服务器重启后密码失效），报错会明确指向「重跑 `ssh_connect`」。
 

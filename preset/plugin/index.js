@@ -667,13 +667,31 @@ const SFTP_OP_TIMEOUT_MS = Number(process.env.DSH_SFTP_OP_TIMEOUT_MS) || 60_000
  * callback of fastPut/fastGet (both directions), so a slow-but-moving link is
  * never killed while a wedged one still is. Env-overridable for tests. */
 const SFTP_STALL_TIMEOUT_MS = Number(process.env.DSH_SFTP_STALL_TIMEOUT_MS) || 60_000
-/** How many 32 KiB chunks one transfer keeps in flight. ssh2's default (64, a
- * 2 MiB pre-read window) delays the FIRST progress signal by the time the whole
- * window needs on the wire — on a slow link that alone can look like a stall and
- * would false-fire the guard below. 16 chunks (512 KiB) keeps the first signal
- * within ~512 KiB of transfer while still allowing ~5 MB/s at 100ms RTT; raise
- * it on fast, high-latency links. Env-overridable. */
-const SFTP_TRANSFER_CONCURRENCY = Number(process.env.DSH_SFTP_TRANSFER_CONCURRENCY) || 16
+/** How many chunks one transfer keeps in flight (see SFTP_CHUNK_SIZE). Every
+ * request costs a round trip and every packet can be dropped on a lossy path, so
+ * a small window keeps a single lost reply from stalling the whole transfer; 4
+ * x 16 KiB still moves ~1 MB/s at 60ms RTT. Env-overridable. */
+const SFTP_TRANSFER_CONCURRENCY = Number(process.env.DSH_SFTP_TRANSFER_CONCURRENCY) || 4
+/** Payload bytes per request, for transfers AND for whole-file writes. Large
+ * single requests are what a path-level packet black hole swallows first —
+ * measured on a host where every control request answered in ~128ms while one
+ * 2 KiB WRITE was never answered at all, and the same file pushed as 16 KiB
+ * chunks moved at ~80 KB/s. Env-overridable. */
+const SFTP_CHUNK_SIZE = Number(process.env.DSH_SFTP_CHUNK_SIZE) || 16 * 1024
+/** Bytes per WRITE request when writing a whole file (ssh_write / ssh_edit). */
+const SFTP_WRITE_CHUNK_BYTES = Number(process.env.DSH_SFTP_WRITE_CHUNK_BYTES) || SFTP_CHUNK_SIZE
+/** How long one WRITE request may go unanswered before that attempt is abandoned
+ * and resumed on a fresh connection. Deliberately short: a healthy chunk
+ * round-trips in well under a second even at ~500ms RTT, while the failure mode
+ * observed in the field is a path that goes silently dead for a while — the
+ * useful response to that is ANOTHER attempt, not a long wait on this one. */
+const SFTP_WRITE_CHUNK_TIMEOUT_MS = Number(process.env.DSH_SFTP_WRITE_CHUNK_TIMEOUT_MS) || 8_000
+/** Reconnect-and-resume attempts for one whole-file write. With the short chunk
+ * timeout above this stays inside the tool call's own budget while giving the
+ * write several chances to land in a healthy window. */
+const SFTP_WRITE_ATTEMPTS = Number(process.env.DSH_SFTP_WRITE_ATTEMPTS) || 6
+/** How long a handle close may go unanswered before it is abandoned. */
+const SFTP_CLOSE_TIMEOUT_MS = Number(process.env.DSH_SFTP_CLOSE_TIMEOUT_MS) || 5_000
 /** Harness-side budget for one transfer tool call (`ToolDefinition.timeoutMs`,
  * enforced by dsh-tool-call-timeout-policy). Deliberately generous: duration is
  * no longer capped by the plugin, so this is only the outer backstop. */
@@ -809,13 +827,113 @@ function sftpReadText(agentId, remotePath, maxBytes, signal) {
   }), SFTP_OP_TIMEOUT_MS, signal)
 }
 
-function sftpWriteText(agentId, remotePath, content, signal) {
-  return sftpCall(agentId, (sftp) => new Promise((resolve, reject) => {
-    const stream = sftp.createWriteStream(remotePath, { encoding: 'utf8' })
-    stream.on('error', reject)
-    stream.on('close', () => resolve())
-    stream.end(content)
-  }), SFTP_OP_TIMEOUT_MS, signal)
+/** Open a remote file and return its SFTP handle. */
+function sftpOpenHandle(sftp, remotePath, flags, signal) {
+  return withTimeout(new Promise((resolve, reject) => {
+    sftp.open(remotePath, flags, (error, handle) => (error ? reject(error) : resolve(handle)))
+  }), SFTP_OP_TIMEOUT_MS, `opening ${remotePath}`, signal)
+}
+
+/** One WRITE request, bounded on its own so a swallowed packet cannot hang the
+ * whole file. `position` is an absolute offset, so a retry can resume. */
+function sftpWriteChunk(sftp, handle, chunk, position, signal) {
+  return withTimeout(new Promise((resolve, reject) => {
+    sftp.write(handle, chunk, 0, chunk.length, position, (error) => (error ? reject(error) : resolve()))
+  }), SFTP_WRITE_CHUNK_TIMEOUT_MS, 'SFTP write chunk', signal)
+}
+
+/** Best-effort handle close. BOUNDED on purpose: on the transport we are trying
+ * to escape, the close reply is exactly as likely to be swallowed as the write,
+ * and an unbounded await here would park the whole call after the failure was
+ * already detected. */
+function sftpCloseHandle(sftp, handle) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(done, SFTP_CLOSE_TIMEOUT_MS)
+    try {
+      sftp.close(handle, done)
+    } catch {
+      done()
+    }
+  })
+}
+
+/**
+ * Write a remote file in small, individually bounded WRITE requests.
+ *
+ * `sftp.createWriteStream()` was the obvious API here and it is the wrong one on
+ * a lossy path: it sends the whole content as ONE SSH_FXP_WRITE and waits for
+ * that request's reply, so a single swallowed data packet wedges the call until
+ * its timeout even though every control request (open/fchmod/stat) still
+ * answers in milliseconds. Measured against a host with exactly that failure
+ * mode: control requests ~128ms, a 2 KiB WRITE never answered, connection dead
+ * afterwards; the same bytes written as 16 KiB chunks completed in ~800ms.
+ *
+ * So: chunk (16 KiB by default — big enough to stay fast, small enough that one
+ * lost packet costs little), bound every chunk, and keep the acknowledged offset
+ * across attempts. `position` is passed explicitly, so after a reconnect the
+ * write resumes at the last acknowledged byte instead of rewriting the file from
+ * zero, and `r+` (not `w`) avoids truncating the prefix that already landed.
+ */
+async function sftpWriteText(agentId, remotePath, content, signal) {
+  const body = Buffer.from(String(content), 'utf8')
+  let position = 0
+  let lastError
+  for (let attempt = 1; attempt <= SFTP_WRITE_ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) throw new Error('aborted')
+    let sftp
+    let handle
+    try {
+      // Attempt 1 rides the connection the caller already verified; a retry has
+      // to re-establish it, because the failed attempt dropped it on purpose.
+      if (attempt > 1) await ensureAlive(agentId, signal)
+      sftp = await openFreshSftp(agentId, signal)
+      // 'w' only while nothing has been acknowledged: after a partial write the
+      // file already holds the prefix we must keep.
+      handle = await sftpOpenHandle(sftp, remotePath, position === 0 ? 'w' : 'r+', signal)
+      while (position < body.length) {
+        if (signal?.aborted) throw new Error('aborted')
+        const end = Math.min(position + SFTP_WRITE_CHUNK_BYTES, body.length)
+        await sftpWriteChunk(sftp, handle, body.subarray(position, end), position, signal)
+        position = end
+      }
+      await sftpCloseHandle(sftp, handle)
+      handle = undefined
+      return
+    } catch (error) {
+      lastError = error
+      if (handle !== undefined && sftp !== undefined) await sftpCloseHandle(sftp, handle)
+      handle = undefined
+      if (signal?.aborted === true || error?.message === 'aborted') {
+        closeConnection(agentId)
+        throw new Error('aborted')
+      }
+      if (!isConnectionFailure(error)) throw error
+      // The transport ate the request: drop the connection so the next attempt
+      // starts on a fresh one (the observed failure mode is per-connection).
+      closeConnection(agentId)
+    } finally {
+      if (sftp !== undefined) {
+        try {
+          sftp.end()
+        } catch {}
+      }
+    }
+  }
+  const wrote = position > 0 ? ` (${position} of ${body.length} bytes were acknowledged and left in place)` : ''
+  throw new Error(
+    `the SSH data path kept losing SFTP write requests after ${SFTP_WRITE_ATTEMPTS} attempts: `
+    + `${lastError?.message ?? 'unknown error'}${wrote}. `
+    + 'This is a network-path problem, not a permissions one: the connection answers control requests while write payloads go unanswered '
+    + '(common with a VPN/TUN proxy or an MTU black hole between this host and the server). '
+    + 'Retry the call, or run the command that needs the file through ssh_bash instead.',
+  )
 }
 
 async function sftpEnsureRemoteDir(agentId, remotePath, signal) {
@@ -868,13 +986,13 @@ function withStallTimeout(operation, stallMs, label, signal) {
  * the harness's own ToolDefinition.timeoutMs backstop. */
 function sftpFastPut(agentId, localPath, remotePath, signal) {
   return sftpCall(agentId, (sftp) => withStallTimeout((bump) => new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, { concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
+    sftp.fastPut(localPath, remotePath, { chunkSize: SFTP_CHUNK_SIZE, concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
   }), SFTP_STALL_TIMEOUT_MS, 'SFTP upload', signal), 0, signal)
 }
 
 function sftpFastGet(agentId, remotePath, localPath, signal) {
   return sftpCall(agentId, (sftp) => withStallTimeout((bump) => new Promise((resolve, reject) => {
-    sftp.fastGet(remotePath, localPath, { concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
+    sftp.fastGet(remotePath, localPath, { chunkSize: SFTP_CHUNK_SIZE, concurrency: SFTP_TRANSFER_CONCURRENCY, step: () => bump() }, (error) => (error ? reject(error) : resolve()))
   }), SFTP_STALL_TIMEOUT_MS, 'SFTP download', signal), 0, signal)
 }
 

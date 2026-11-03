@@ -87,11 +87,17 @@ function functionSource(src, name) {
 
 function loadSftpLayer(file) {
   const src = readFileSync(file, 'utf8')
-  const constNames = ['SFTP_OPEN_TIMEOUT_MS', 'SFTP_OP_TIMEOUT_MS', 'SFTP_TRANSFER_TIMEOUT_MS', 'SFTP_STALL_TIMEOUT_MS', 'SFTP_TRANSFER_CONCURRENCY']
-  const constValues = constNames.map((n) => {
+  const constNames = ['SFTP_OPEN_TIMEOUT_MS', 'SFTP_OP_TIMEOUT_MS', 'SFTP_TRANSFER_TIMEOUT_MS', 'SFTP_STALL_TIMEOUT_MS', 'SFTP_CHUNK_SIZE', 'SFTP_TRANSFER_CONCURRENCY']
+  const constValues = []
+  for (const n of constNames) {
     const m = new RegExp(`^const ${n} = (.+)$`, 'm').exec(src)
-    return m === null ? 0 : eval(m[1]) // eslint-disable-line no-eval
-  })
+    // Resolve in declaration order: SFTP_TRANSFER_CONCURRENCY is independent, but
+    // a constant may be expressed in terms of an earlier one.
+    const declared = constNames.slice(0, constValues.length)
+    // A constant absent from the pre-fix source simply stays 0.
+    const expr = m === null ? '0' : m[1]
+    constValues.push(new Function(...declared, `return (${expr})`)(...constValues))
+  }
   const names = ['notConnectedError', 'withTimeout', 'isConnectionFailure', 'openFreshSftp', 'withStallTimeout', 'sftpCall', 'sftpFastGet', 'sftpFastPut']
   const fns = names.map((n) => functionSource(src, n)).filter((t) => t !== '').join('\n')
   const factory = new Function(
